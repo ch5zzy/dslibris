@@ -519,3 +519,201 @@ bool StarDict::GetEntryByIndex(uint32_t targetIndex, StarDictEntry& outEntry) {
     return false;
 }
 
+void StarDict::CollectNearby(int blockIdx, uint32_t targetOffset,
+                             std::vector<std::string>& nearbyOut, int maxNearby) {
+    nearbyOut.clear();
+    if (maxNearby <= 0 || idxCheckpoints.empty()) return;
+
+    int startBlock = (blockIdx > 0) ? (blockIdx - 1) : 0;
+    int endBlock = (blockIdx + 1 < static_cast<int>(idxCheckpoints.size()))
+                       ? (blockIdx + 1)
+                       : (static_cast<int>(idxCheckpoints.size()) - 1);
+
+    uint32_t startOff = idxCheckpoints[startBlock].fileOffset;
+    uint32_t endOff = (endBlock + 1 < static_cast<int>(idxCheckpoints.size()))
+                          ? idxCheckpoints[endBlock + 1].fileOffset
+                          : static_cast<uint32_t>(info.idxFileSize);
+
+    if (endOff <= startOff) return;
+    size_t span = endOff - startOff;
+    // Cap memory usage for huge blocks
+    if (span > 32768) {
+        startOff = idxCheckpoints[blockIdx].fileOffset;
+        endOff = (blockIdx + 1 < static_cast<int>(idxCheckpoints.size()))
+                     ? idxCheckpoints[blockIdx + 1].fileOffset
+                     : static_cast<uint32_t>(info.idxFileSize);
+        if (endOff <= startOff) return;
+        span = endOff - startOff;
+    }
+
+    std::vector<unsigned char> buf(span);
+    if (fseek(idxFile, static_cast<long>(startOff), SEEK_SET) != 0) return;
+    size_t got = fread(buf.data(), 1, span, idxFile);
+    if (got == 0) return;
+
+    uint32_t metaSize = (info.idxOffsetBits == 64) ? 12 : 8;
+    std::vector<std::string> words;
+    int targetPosIdx = -1;
+
+    size_t p = 0;
+    while (p < got) {
+        uint32_t curAbs = startOff + static_cast<uint32_t>(p);
+        size_t nul = p;
+        while (nul < got && buf[nul] != 0) nul++;
+        if (nul + 1 + metaSize > got) break;
+
+        if (targetPosIdx < 0 && curAbs >= targetOffset) {
+            targetPosIdx = static_cast<int>(words.size());
+        }
+        words.emplace_back(reinterpret_cast<const char*>(buf.data() + p), nul - p);
+        p = nul + 1 + metaSize;
+    }
+
+    if (words.empty()) return;
+    if (targetPosIdx < 0) targetPosIdx = static_cast<int>(words.size()) - 1;
+
+    int half = maxNearby / 2;
+    int begin = targetPosIdx - half;
+    if (begin < 0) begin = 0;
+    int end = begin + maxNearby;
+    if (end > static_cast<int>(words.size())) {
+        end = static_cast<int>(words.size());
+        begin = std::max(0, end - maxNearby);
+    }
+
+    for (int i = begin; i < end; i++) {
+        nearbyOut.push_back(words[i]);
+    }
+}
+
+bool StarDict::FindWord(const std::string& word, StarDictEntry& outEntry,
+                        std::vector<std::string>* nearbyOut, int maxNearby) {
+    if (word.empty() || !EnsureIdxIndexed()) return false;
+
+    // 1. Binary search checkpoints using ASCII case-insensitive comparison.
+    // Find the last checkpoint whose first word <= word (case-insensitively).
+    // If multiple entries share the same ASCII-lowercase key across a block boundary,
+    // step back one block so we don't miss an earlier case variant.
+    int lo = 0;
+    int hi = static_cast<int>(idxCheckpoints.size()) - 1;
+    int block = 0;
+
+    while (lo <= hi) {
+        int mid = lo + (hi - lo) / 2;
+        std::string w;
+        if (!ReadIdxWordAt(idxCheckpoints[mid].fileOffset, w)) return false;
+        int cmp = AsciiStrCaseCmp(w.c_str(), word.c_str());
+        if (cmp <= 0) {
+            block = mid;
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+
+    // Step back while previous block's start word has same case-insensitive key.
+    while (block > 0) {
+        std::string w;
+        if (!ReadIdxWordAt(idxCheckpoints[block].fileOffset, w)) break;
+        if (AsciiStrCaseCmp(w.c_str(), word.c_str()) == 0) {
+            block--;
+        } else {
+            break;
+        }
+    }
+
+    // 2. Scan the block (and if a case-insensitive match spans into the next block, check that too).
+    bool foundCaseInsensitive = false;
+    StarDictEntry bestEntry;
+    uint32_t insertionOffset = idxCheckpoints[block].fileOffset;
+    bool recordedInsertion = false;
+
+    uint32_t metaSize = (info.idxOffsetBits == 64) ? 12 : 8;
+
+    for (int b = block; b < static_cast<int>(idxCheckpoints.size()); b++) {
+        uint32_t startOff = idxCheckpoints[b].fileOffset;
+        uint32_t endOff = (b + 1 < static_cast<int>(idxCheckpoints.size()))
+                              ? idxCheckpoints[b + 1].fileOffset
+                              : static_cast<uint32_t>(info.idxFileSize);
+        if (endOff <= startOff) break;
+
+        size_t span = endOff - startOff;
+        std::vector<unsigned char> buf(span);
+        if (fseek(idxFile, static_cast<long>(startOff), SEEK_SET) != 0) return false;
+        size_t got = fread(buf.data(), 1, span, idxFile);
+
+        size_t p = 0;
+        uint32_t idx = idxCheckpoints[b].entryIndex;
+        bool passedTarget = false;
+
+        while (p < got) {
+            uint32_t curOff = startOff + static_cast<uint32_t>(p);
+            size_t nul = p;
+            while (nul < got && buf[nul] != 0) nul++;
+            if (nul + 1 + metaSize > got) break;
+
+            const char* entryWord = reinterpret_cast<const char*>(buf.data() + p);
+            int ci = AsciiStrCaseCmp(entryWord, word.c_str());
+
+            if (ci == 0) {
+                StarDictEntry cand;
+                cand.headword.assign(entryWord, nul - p);
+                const unsigned char* meta = buf.data() + nul + 1;
+                if (info.idxOffsetBits == 64) {
+                    cand.dataOffset = ReadBE64(meta);
+                    cand.dataSize = ReadBE32(meta + 8);
+                } else {
+                    cand.dataOffset = ReadBE32(meta);
+                    cand.dataSize = ReadBE32(meta + 4);
+                }
+                cand.entryIndex = idx;
+
+                if (!foundCaseInsensitive) {
+                    bestEntry = cand;
+                    foundCaseInsensitive = true;
+                    insertionOffset = curOff;
+                    recordedInsertion = true;
+                }
+                // Exact byte match wins immediately!
+                if (cand.headword == word) {
+                    outEntry = cand;
+                    if (nearbyOut) CollectNearby(b, curOff, *nearbyOut, maxNearby);
+                    return true;
+                }
+            } else if (ci > 0) {
+                if (!recordedInsertion) {
+                    insertionOffset = curOff;
+                    recordedInsertion = true;
+                }
+                passedTarget = true;
+                break;
+            }
+
+            p = nul + 1 + metaSize;
+            idx++;
+        }
+
+        if (passedTarget) break;
+        if (!foundCaseInsensitive && b + 1 < static_cast<int>(idxCheckpoints.size())) {
+            std::string nextFirst;
+            if (!ReadIdxWordAt(idxCheckpoints[b + 1].fileOffset, nextFirst) ||
+                AsciiStrCaseCmp(nextFirst.c_str(), word.c_str()) > 0) {
+                insertionOffset = endOff;
+                recordedInsertion = true;
+                break;
+            }
+        }
+    }
+
+    if (foundCaseInsensitive) {
+        outEntry = bestEntry;
+        if (nearbyOut) CollectNearby(block, insertionOffset, *nearbyOut, maxNearby);
+        return true;
+    }
+
+    if (nearbyOut) {
+        CollectNearby(block, insertionOffset, *nearbyOut, maxNearby);
+    }
+    return false;
+}
+
