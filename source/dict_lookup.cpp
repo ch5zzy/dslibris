@@ -607,3 +607,158 @@ bool DictionaryManager::LookupExactHeadword(const std::string& headword, LookupR
     return false;
 }
 
+bool DictionaryManager::Lookup(const std::string& rawToken, LookupResult& out, bool isCjkContext) {
+    out = LookupResult();
+    if (!EnsureActiveOpen()) return false;
+
+    std::string cleaned = DictText::CleanToken(rawToken);
+    if (cleaned.empty()) return false;
+    out.queried = cleaned;
+
+    uint32_t firstCp = 0;
+    DictText::Utf8Decode(cleaned.data(), cleaned.size(), &firstCp);
+    if (isCjkContext || DictText::IsCjkCodepoint(firstCp)) {
+        size_t maxChars = std::min<size_t>(DictText::Utf8CharCount(cleaned), 8);
+        StarDictEntry entry;
+        for (size_t len = maxChars; len >= 1; len--) {
+            std::string sub = DictText::Utf8PrefixChars(cleaned, len);
+            bool capture = (len == maxChars);
+            if (TryExactOrSyn(sub, entry, &out.nearby, capture)) {
+                out.found = true;
+                out.matchedViaFallback = (len < maxChars);
+                out.queried = sub;
+                out.headword = entry.headword;
+                activeDict.ReadDefinition(entry, out.definition);
+                return true;
+            }
+            if (activeLemma.IsOpen()) {
+                std::vector<std::string> lemmas;
+                if (activeLemma.FindLemmas(sub, lemmas)) {
+                    for (const auto& lem : lemmas) {
+                        if (TryExactOrSyn(lem, entry, nullptr, false)) {
+                            out.found = true;
+                            out.matchedViaFallback = true;
+                            out.queried = sub;
+                            out.headword = entry.headword;
+                            activeDict.ReadDefinition(entry, out.definition);
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    std::vector<std::string> primaryCandidates;
+    AddUnique(primaryCandidates, cleaned);
+
+    std::string lower = DictText::ToLowerUtf8(cleaned);
+    AddUnique(primaryCandidates, lower);
+
+    size_t apos = lower.find('\'');
+    if (apos != std::string::npos && apos <= 3 && apos + 1 < lower.size()) {
+        AddUnique(primaryCandidates, lower.substr(apos + 1));
+    }
+
+    if (lower.size() > 2 && lower.compare(lower.size() - 2, 2, "'s") == 0) {
+        AddUnique(primaryCandidates, lower.substr(0, lower.size() - 2));
+    } else if (lower.size() > 1 && lower.back() == '\'') {
+        AddUnique(primaryCandidates, lower.substr(0, lower.size() - 1));
+    }
+
+    std::string strippedMarks = DictText::StripCombiningMarks(lower);
+    AddUnique(primaryCandidates, strippedMarks);
+
+    StarDictEntry entry;
+    for (size_t i = 0; i < primaryCandidates.size(); i++) {
+        bool capture = (i == 0 || (i == 1 && out.nearby.empty()));
+        if (TryExactOrSyn(primaryCandidates[i], entry, &out.nearby, capture)) {
+            out.found = true;
+            out.matchedViaFallback = (i > 1);
+            out.headword = entry.headword;
+            activeDict.ReadDefinition(entry, out.definition);
+            return true;
+        }
+    }
+
+    if (activeLemma.IsOpen()) {
+        for (const auto& cand : primaryCandidates) {
+            std::vector<std::string> lemmas;
+            if (activeLemma.FindLemmas(cand, lemmas)) {
+                for (const auto& lem : lemmas) {
+                    if (TryExactOrSyn(lem, entry, nullptr, false)) {
+                        out.found = true;
+                        out.matchedViaFallback = true;
+                        out.headword = entry.headword;
+                        activeDict.ReadDefinition(entry, out.definition);
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    std::string base = strippedMarks.empty() ? lower : strippedMarks;
+    size_t dash = base.find('-');
+    if (dash != std::string::npos && dash > 0 && dash + 1 < base.size()) {
+        std::string noDash;
+        for (char ch : base) if (ch != '-') noDash.push_back(ch);
+        if (TryExactOrSyn(noDash, entry, nullptr, false)) {
+            out.found = true;
+            out.matchedViaFallback = true;
+            out.headword = entry.headword;
+            activeDict.ReadDefinition(entry, out.definition);
+            return true;
+        }
+    }
+
+    size_t charLen = DictText::Utf8CharCount(base);
+    if (charLen >= 4) {
+        size_t minLen = std::max<size_t>(3, (charLen + 1) / 2);
+        size_t maxTrim = std::min<size_t>(5, charLen - minLen);
+
+        for (size_t trim = 1; trim <= maxTrim; trim++) {
+            std::string stem = DictText::Utf8PrefixChars(base, charLen - trim);
+            if (TryExactOrSyn(stem, entry, nullptr, false)) {
+                out.found = true;
+                out.matchedViaFallback = true;
+                out.headword = entry.headword;
+                activeDict.ReadDefinition(entry, out.definition);
+                return true;
+            }
+            if (stem.size() >= 3 && static_cast<unsigned char>(stem.back()) < 0x80) {
+                std::string withE = stem + "e";
+                if (TryExactOrSyn(withE, entry, nullptr, false)) {
+                    out.found = true;
+                    out.matchedViaFallback = true;
+                    out.headword = entry.headword;
+                    activeDict.ReadDefinition(entry, out.definition);
+                    return true;
+                }
+                if (stem.back() == 'i') {
+                    std::string withY = stem.substr(0, stem.size() - 1) + "y";
+                    if (TryExactOrSyn(withY, entry, nullptr, false)) {
+                        out.found = true;
+                        out.matchedViaFallback = true;
+                        out.headword = entry.headword;
+                        activeDict.ReadDefinition(entry, out.definition);
+                        return true;
+                    }
+                }
+                if (stem.size() >= 4 && stem[stem.size() - 1] == stem[stem.size() - 2]) {
+                    std::string undoubled = stem.substr(0, stem.size() - 1);
+                    if (TryExactOrSyn(undoubled, entry, nullptr, false)) {
+                        out.found = true;
+                        out.matchedViaFallback = true;
+                        out.headword = entry.headword;
+                        activeDict.ReadDefinition(entry, out.definition);
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    return false;
+}
