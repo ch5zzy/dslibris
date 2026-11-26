@@ -1,6 +1,6 @@
 # dslibris
 
-[![C/C++ CI](https://github.com/rhaleblian/dslibris/actions/workflows/build.yml/badge.svg)](https://github.com/rhaleblian/dslibris/actions/workflows/build.yml)
+[![C/C++ CI](https://github.com/ch5zzy/dslibris/actions/workflows/build.yml/badge.svg)](https://github.com/ch5zzy/dslibris/actions/workflows/build.yml)
 
 **dslibris** is an
 [EPUB](https://en.wikipedia.org/wiki/EPUB)
@@ -42,8 +42,6 @@ then
 `dslibris.nds` should show up in the top directory.
 
 ## See Also
-
-Blog: <http://ray.haleblian.com/wordpress/dslibris-an-ebook-reader-for-the-nintendo-ds/>
 
 Development Tools: <http://devkitpro.org>
 
