@@ -40,7 +40,10 @@ extern char msg[];
 std::stringstream ss;
 
 void Text::CopyScreen(u16 *src, u16 *dst) {
-	memcpy(src, dst, display.width * display.height * sizeof(u16));
+	const size_t bytes = display.height * display.height * sizeof(u16);
+	DC_FlushRange(src, bytes);
+	swiWaitForVBlank();
+	dmaCopy(src, dst, bytes);
 }
 
 Text::Text()
@@ -55,7 +58,7 @@ Text::Text()
 
 	screenleft = (u16*)BG_BMP_RAM_SUB(0);
 	screenright = (u16*)BG_BMP_RAM(0);
-	offscreen = new u16[display.width * display.height];
+	offscreen = new u16[display.height * display.height];
 	margin.left = MARGINLEFT;
 	margin.right = MARGINRIGHT;
 	margin.top = MARGINTOP;
@@ -95,7 +98,7 @@ Text::Text()
 Text::~Text()
 {
 	// framebuffers
-	free(offscreen);
+	delete[] offscreen;
 	
 	// homemade cache
 	ClearCache();
@@ -319,10 +322,10 @@ void Text::ClearCache(FT_Face face)
 
 void Text::ClearScreen()
 {
-	const int pixelcount = display.width*display.height;
-	if(invert) memset((void*)screen,0,pixelcount*4);
+	const size_t bytes = display.height * display.height * sizeof(u16);
+	if(invert) memset((void*)screen, 0, bytes);
 	else {
-		memset((void*)screen,255,pixelcount*4);
+		memset((void*)screen, 255, bytes);
 		
 		// alternately, off-white...
 		// const u16 pixel = RGB15(29,29,29)|BIT(15);
@@ -546,7 +549,8 @@ void Text::PrintChar(u32 ucs, FT_Face face) {
 	// Draw a character for the given UCS codepoint,
 	// into the current screen buffer at the current pen position.
 
-	u16 bx, by, width, height = 0;
+	s16 bx, by;
+	u16 width, height = 0;
 	FT_Byte *buffer = NULL;
 	FT_UInt advance = 0;
 	FTC_Node anode = nullptr;
@@ -622,9 +626,11 @@ void Text::PrintChar(u32 ucs, FT_Face face) {
 #ifdef DRAW_CACHE_MISSES
 			// if(!hit) pixel = RGB15(a>>3,0,0) | BIT(15);
 #endif
-			u16 sx = (pen.x+gx+bx);
-			u16 sy = (pen.y+gy-by);
-			screen[sy*display.height+sx] = pixel;
+			int sx = static_cast<int>(pen.x) + gx + bx;
+			int sy = static_cast<int>(pen.y) + gy - by;
+			if (sx >= 0 && sx < display.width && sy >= 0 && sy < display.height) {
+				screen[sy*display.height+sx] = pixel;
+			}
 		}
 	}
 
