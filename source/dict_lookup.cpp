@@ -454,3 +454,156 @@ bool LemmaTable::FindLemmas(const std::string& word, std::vector<std::string>& o
 // DictionaryManager (single active dictionary, selected in Settings)
 // ---------------------------------------------------------------------------
 
+DictionaryManager::DictionaryManager() : activeIndex(-1) {}
+
+DictionaryManager::~DictionaryManager() {
+    CloseActive();
+}
+
+int DictionaryManager::ScanDirectory(const std::string& dictDir) {
+    CloseActive();
+    dictionaries.clear();
+    activeIndex = -1;
+    rootDir = dictDir;
+
+    auto scanFolder = [&](const std::string& folder) {
+        DIR* dp = opendir(folder.c_str());
+        if (!dp) return;
+        struct dirent* ent;
+        while ((ent = readdir(dp)) != nullptr) {
+            if (ent->d_name[0] == '.') continue;
+            std::string full = folder + "/" + ent->d_name;
+            if (EndsWithCaseInsensitive(ent->d_name, ".ifo") && IsRegularFile(full)) {
+                StarDictInfo info;
+                if (StarDict::ParseIfo(full, info)) {
+                    dictionaries.push_back(info);
+                }
+            }
+        }
+        closedir(dp);
+    };
+
+    scanFolder(dictDir);
+
+    DIR* dp = opendir(dictDir.c_str());
+    if (dp) {
+        struct dirent* ent;
+        while ((ent = readdir(dp)) != nullptr) {
+            if (ent->d_name[0] == '.') continue;
+            std::string sub = dictDir + "/" + ent->d_name;
+            if (IsDir(sub)) {
+                scanFolder(sub);
+            }
+        }
+        closedir(dp);
+    }
+
+    std::sort(dictionaries.begin(), dictionaries.end(),
+              [](const StarDictInfo& a, const StarDictInfo& b) {
+                  return AsciiCaseCmp(a.bookName.c_str(), b.bookName.c_str()) < 0;
+              });
+
+    if (!dictionaries.empty()) {
+        activeIndex = 0;
+    }
+    return static_cast<int>(dictionaries.size());
+}
+
+void DictionaryManager::CloseActive() {
+    activeDict.Close();
+    activeLemma.Close();
+}
+
+bool DictionaryManager::SelectDictionary(int index) {
+    if (index < 0 || index >= static_cast<int>(dictionaries.size())) return false;
+    if (index != activeIndex) {
+        CloseActive();
+        activeIndex = index;
+    }
+    return true;
+}
+
+bool DictionaryManager::SelectByPath(const std::string& ifoPathOrName) {
+    if (ifoPathOrName.empty()) return false;
+    for (size_t i = 0; i < dictionaries.size(); i++) {
+        const std::string& p = dictionaries[i].ifoPath;
+        if (p == ifoPathOrName || dictionaries[i].bookName == ifoPathOrName) {
+            return SelectDictionary(static_cast<int>(i));
+        }
+        size_t slash = p.find_last_of("/\\");
+        std::string base = (slash == std::string::npos) ? p : p.substr(slash + 1);
+        if (base == ifoPathOrName) {
+            return SelectDictionary(static_cast<int>(i));
+        }
+    }
+    return false;
+}
+
+std::string DictionaryManager::GetActiveIfoPath() const {
+    if (activeIndex < 0 || activeIndex >= static_cast<int>(dictionaries.size())) {
+        return std::string();
+    }
+    return dictionaries[activeIndex].ifoPath;
+}
+
+std::string DictionaryManager::GetActiveBookName() const {
+    if (activeIndex < 0 || activeIndex >= static_cast<int>(dictionaries.size())) {
+        return std::string("none");
+    }
+    return dictionaries[activeIndex].bookName;
+}
+
+void DictionaryManager::TryOpenLemmaSidecar(const std::string& ifoPath) {
+    activeLemma.Close();
+    if (ifoPath.size() < 4) return;
+    std::string sidecar = ifoPath.substr(0, ifoPath.size() - 4) + ".lem";
+    if (IsRegularFile(sidecar)) {
+        activeLemma.Open(sidecar);
+        return;
+    }
+    if (!rootDir.empty()) {
+        std::string fallback = rootDir + "/morph/default.lem";
+        if (IsRegularFile(fallback)) {
+            activeLemma.Open(fallback);
+        }
+    }
+}
+
+bool DictionaryManager::EnsureActiveOpen() {
+    if (activeIndex < 0 || activeIndex >= static_cast<int>(dictionaries.size())) {
+        return false;
+    }
+    if (activeDict.IsOpen()) return true;
+
+    const std::string& ifo = dictionaries[activeIndex].ifoPath;
+    if (!activeDict.Open(ifo)) return false;
+    TryOpenLemmaSidecar(ifo);
+    return true;
+}
+
+bool DictionaryManager::TryExactOrSyn(const std::string& candidate, StarDictEntry& entry,
+                                      std::vector<std::string>* nearbyOut, bool captureNearby) {
+    if (activeDict.FindWord(candidate, entry, captureNearby ? nearbyOut : nullptr, 5)) {
+        return true;
+    }
+    if (activeDict.FindSynonym(candidate, entry)) {
+        return true;
+    }
+    return false;
+}
+
+bool DictionaryManager::LookupExactHeadword(const std::string& headword, LookupResult& out) {
+    out = LookupResult();
+    out.queried = headword;
+    if (!EnsureActiveOpen()) return false;
+
+    StarDictEntry entry;
+    if (activeDict.FindWord(headword, entry, &out.nearby, 5)) {
+        out.found = true;
+        out.headword = entry.headword;
+        activeDict.ReadDefinition(entry, out.definition);
+        return true;
+    }
+    return false;
+}
+
