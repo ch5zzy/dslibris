@@ -245,3 +245,277 @@ void StarDict::Close() {
     dzChunkLen = 0;
 }
 
+bool StarDict::ParseDictZipHeader() {
+    if (!dictFile) return false;
+    if (fseek(dictFile, 0, SEEK_SET) != 0) return false;
+
+    unsigned char hdr[10];
+    if (fread(hdr, 1, 10, dictFile) != 10) return false;
+    if (hdr[0] != 0x1F || hdr[1] != 0x8B || hdr[2] != 8) return false;
+
+    unsigned char flg = hdr[3];
+    if ((flg & 0x04) == 0) return false; // FEXTRA required for dictzip
+
+    unsigned char xlenBuf[2];
+    if (fread(xlenBuf, 1, 2, dictFile) != 2) return false;
+    uint16_t xlen = ReadLE16(xlenBuf);
+
+    std::vector<unsigned char> extra(xlen);
+    if (fread(extra.data(), 1, xlen, dictFile) != xlen) return false;
+
+    bool foundRA = false;
+    size_t pos = 0;
+    std::vector<uint16_t> chunkSizes;
+    while (pos + 4 <= extra.size()) {
+        unsigned char si1 = extra[pos];
+        unsigned char si2 = extra[pos + 1];
+        uint16_t slen = ReadLE16(&extra[pos + 2]);
+        pos += 4;
+        if (pos + slen > extra.size()) break;
+
+        if (si1 == 'R' && si2 == 'A' && slen >= 6) {
+            uint16_t ver = ReadLE16(&extra[pos]);
+            if (ver != 1) return false;
+            dzChunkLen = ReadLE16(&extra[pos + 2]);
+            uint16_t chcnt = ReadLE16(&extra[pos + 4]);
+            if (dzChunkLen == 0 || static_cast<size_t>(6 + chcnt * 2) > slen) return false;
+
+            chunkSizes.resize(chcnt);
+            for (uint16_t i = 0; i < chcnt; i++) {
+                chunkSizes[i] = ReadLE16(&extra[pos + 6 + i * 2]);
+            }
+            foundRA = true;
+            break;
+        }
+        pos += slen;
+    }
+
+    if (!foundRA) return false;
+
+    // Skip optional FNAME
+    if (flg & 0x08) {
+        int c;
+        while ((c = fgetc(dictFile)) != EOF && c != 0) {}
+        if (c == EOF) return false;
+    }
+    // Skip optional FCOMMENT
+    if (flg & 0x10) {
+        int c;
+        while ((c = fgetc(dictFile)) != EOF && c != 0) {}
+        if (c == EOF) return false;
+    }
+    // Skip optional FHCRC
+    if (flg & 0x02) {
+        if (fseek(dictFile, 2, SEEK_CUR) != 0) return false;
+    }
+
+    long dataStart = ftell(dictFile);
+    if (dataStart < 0) return false;
+
+    dzChunkOffsets.resize(chunkSizes.size() + 1);
+    uint32_t cur = static_cast<uint32_t>(dataStart);
+    for (size_t i = 0; i < chunkSizes.size(); i++) {
+        dzChunkOffsets[i] = cur;
+        cur += chunkSizes[i];
+    }
+    dzChunkOffsets[chunkSizes.size()] = cur;
+    return true;
+}
+
+bool StarDict::EnsureIdxIndexed() {
+    if (idxIndexed) return !idxCheckpoints.empty();
+    if (!idxFile) return false;
+
+    idxCheckpoints.clear();
+    uint64_t fileSize = info.idxFileSize;
+    if (fileSize == 0) {
+        fileSize = GetFileSize(info.idxPath);
+        info.idxFileSize = fileSize;
+    }
+    if (fileSize == 0) return false;
+
+    uint32_t metaSize = (info.idxOffsetBits == 64) ? 12 : 8;
+    uint32_t blockBytes = static_cast<uint32_t>(fileSize / kMaxCheckpoints);
+    if (blockBytes < kMinBlockBytes) blockBytes = kMinBlockBytes;
+
+    if (fseek(idxFile, 0, SEEK_SET) != 0) return false;
+
+    std::vector<unsigned char> buf(kScanBufSize);
+    uint32_t filePos = 0;
+    uint32_t entryIdx = 0;
+    uint32_t nextCheckpointOffset = 0;
+
+    // State machine: 0 = scanning word until '\0', >0 = skipping remaining meta bytes
+    uint32_t skipMeta = 0;
+    bool atEntryStart = true;
+
+    while (true) {
+        size_t n = fread(buf.data(), 1, buf.size(), idxFile);
+        if (n == 0) break;
+
+        for (size_t i = 0; i < n; i++, filePos++) {
+            if (skipMeta > 0) {
+                skipMeta--;
+                if (skipMeta == 0) {
+                    entryIdx++;
+                    atEntryStart = true;
+                }
+                continue;
+            }
+            if (atEntryStart) {
+                if (filePos >= nextCheckpointOffset) {
+                    idxCheckpoints.push_back({filePos, entryIdx});
+                    nextCheckpointOffset = filePos + blockBytes;
+                }
+                atEntryStart = false;
+            }
+            if (buf[i] == 0) {
+                skipMeta = metaSize;
+            }
+        }
+    }
+
+    idxIndexed = true;
+    return !idxCheckpoints.empty();
+}
+
+bool StarDict::EnsureSynIndexed() {
+    if (synIndexed) return !synCheckpoints.empty();
+    if (!synFile) return false;
+
+    synCheckpoints.clear();
+    uint64_t fileSize = GetFileSize(info.synPath);
+    if (fileSize == 0) return false;
+
+    uint32_t blockBytes = static_cast<uint32_t>(fileSize / kMaxCheckpoints);
+    if (blockBytes < kMinBlockBytes) blockBytes = kMinBlockBytes;
+
+    if (fseek(synFile, 0, SEEK_SET) != 0) return false;
+
+    std::vector<unsigned char> buf(kScanBufSize);
+    uint32_t filePos = 0;
+    uint32_t entryIdx = 0;
+    uint32_t nextCheckpointOffset = 0;
+    uint32_t skipMeta = 0;
+    bool atEntryStart = true;
+
+    while (true) {
+        size_t n = fread(buf.data(), 1, buf.size(), synFile);
+        if (n == 0) break;
+
+        for (size_t i = 0; i < n; i++, filePos++) {
+            if (skipMeta > 0) {
+                skipMeta--;
+                if (skipMeta == 0) {
+                    entryIdx++;
+                    atEntryStart = true;
+                }
+                continue;
+            }
+            if (atEntryStart) {
+                if (filePos >= nextCheckpointOffset) {
+                    synCheckpoints.push_back({filePos, entryIdx});
+                    nextCheckpointOffset = filePos + blockBytes;
+                }
+                atEntryStart = false;
+            }
+            if (buf[i] == 0) {
+                skipMeta = 4;
+            }
+        }
+    }
+
+    synIndexed = true;
+    return !synCheckpoints.empty();
+}
+
+bool StarDict::ReadIdxWordAt(uint32_t fileOffset, std::string& outWord) {
+    if (fseek(idxFile, static_cast<long>(fileOffset), SEEK_SET) != 0) return false;
+    char tmp[260];
+    size_t n = fread(tmp, 1, sizeof(tmp) - 1, idxFile);
+    if (n == 0) return false;
+    tmp[n] = '\0';
+    outWord.assign(tmp);
+    return true;
+}
+
+bool StarDict::ReadIdxEntryAt(uint32_t fileOffset, uint32_t entryIndex,
+                              StarDictEntry& out, uint32_t& nextOffset) {
+    if (fseek(idxFile, static_cast<long>(fileOffset), SEEK_SET) != 0) return false;
+    unsigned char buf[280];
+    size_t n = fread(buf, 1, sizeof(buf), idxFile);
+    if (n == 0) return false;
+
+    size_t nul = 0;
+    while (nul < n && buf[nul] != 0) nul++;
+    uint32_t metaSize = (info.idxOffsetBits == 64) ? 12 : 8;
+    if (nul + 1 + metaSize > n) return false;
+
+    out.headword.assign(reinterpret_cast<const char*>(buf), nul);
+    const unsigned char* meta = buf + nul + 1;
+    if (info.idxOffsetBits == 64) {
+        out.dataOffset = ReadBE64(meta);
+        out.dataSize = ReadBE32(meta + 8);
+    } else {
+        out.dataOffset = ReadBE32(meta);
+        out.dataSize = ReadBE32(meta + 4);
+    }
+    out.entryIndex = entryIndex;
+    nextOffset = fileOffset + static_cast<uint32_t>(nul + 1 + metaSize);
+    return true;
+}
+
+bool StarDict::ReadSynEntryAt(uint32_t fileOffset, std::string& outWord,
+                              uint32_t& outOrigIndex, uint32_t& nextOffset) {
+    if (fseek(synFile, static_cast<long>(fileOffset), SEEK_SET) != 0) return false;
+    unsigned char buf[270];
+    size_t n = fread(buf, 1, sizeof(buf), synFile);
+    if (n == 0) return false;
+
+    size_t nul = 0;
+    while (nul < n && buf[nul] != 0) nul++;
+    if (nul + 5 > n) return false;
+
+    outWord.assign(reinterpret_cast<const char*>(buf), nul);
+    outOrigIndex = ReadBE32(buf + nul + 1);
+    nextOffset = fileOffset + static_cast<uint32_t>(nul + 5);
+    return true;
+}
+
+bool StarDict::GetEntryByIndex(uint32_t targetIndex, StarDictEntry& outEntry) {
+    if (!EnsureIdxIndexed()) return false;
+
+    // Binary search checkpoints by entryIndex.
+    int lo = 0;
+    int hi = static_cast<int>(idxCheckpoints.size()) - 1;
+    int block = 0;
+    while (lo <= hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (idxCheckpoints[mid].entryIndex <= targetIndex) {
+            block = mid;
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+
+    uint32_t pos = idxCheckpoints[block].fileOffset;
+    uint32_t idx = idxCheckpoints[block].entryIndex;
+    uint32_t endPos = (block + 1 < static_cast<int>(idxCheckpoints.size()))
+                          ? idxCheckpoints[block + 1].fileOffset
+                          : static_cast<uint32_t>(info.idxFileSize);
+
+    while (pos < endPos) {
+        StarDictEntry cur;
+        uint32_t nextPos = 0;
+        if (!ReadIdxEntryAt(pos, idx, cur, nextPos)) return false;
+        if (idx == targetIndex) {
+            outEntry = cur;
+            return true;
+        }
+        pos = nextPos;
+        idx++;
+    }
+    return false;
+}
+
