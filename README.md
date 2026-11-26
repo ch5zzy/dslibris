@@ -12,6 +12,8 @@ ebook reader for the Nintendo DS.
 
 ![A sample page](etc/sample/iliad.png)
 
+![Dictionary lookup](etc/sample/dictionary.gif)
+
 ## Installation
 
 See the
