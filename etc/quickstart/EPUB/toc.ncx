@@ -39,6 +39,18 @@
         </navLabel>
         <content src="text/ch001.xhtml#adding-fonts" />
       </navPoint>
+      <navPoint id="navPoint-5">
+        <navLabel>
+          <text>Adding Dictionaries</text>
+        </navLabel>
+        <content src="text/ch001.xhtml#adding-dictionaries" />
+      </navPoint>
+      <navPoint id="navPoint-6">
+        <navLabel>
+          <text>Looking Up Words</text>
+        </navLabel>
+        <content src="text/ch001.xhtml#looking-up-words" />
+      </navPoint>
     </navPoint>
   </navMap>
 </ncx>
