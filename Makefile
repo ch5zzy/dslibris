@@ -8,11 +8,11 @@ DEVKITARM ?= /opt/devkitpro/devkitARM
 VERSION ?= $(cat include/version.h)
 
 GAME_TITLE := dslibris
-GAME_SUBTITLE1 := An EPUB ebook reader [$(VERSION)]
-GAME_SUBTITLE2 := https://github.com/rhaleblian/dslibris
+GAME_SUBTITLE1 := An ebook reader
 GAME_ICON := $(PWD)/gfx/icon.bmp
 
 include $(DEVKITARM)/ds_rules
+GAME_SUBTITLE2 :=
 
 #---------------------------------------------------------------------------------
 # TARGET is the name of the output
@@ -115,6 +115,8 @@ DEPENDS	:=	$(OFILES:.o=.d)
 # main targets
 #---------------------------------------------------------------------------------
 $(OUTPUT).nds	: 	$(OUTPUT).elf
+	$(SILENTCMD)ndstool -c $@ -9 $< $(_ARM7_ELF) -b $(GAME_ICON) "$(GAME_TITLE);$(GAME_SUBTITLE1)" $(_ADDFILES)
+	$(SILENTMSG) built ... $(notdir $@)
 $(OUTPUT).elf	:	$(OFILES)
 
 #---------------------------------------------------------------------------------
