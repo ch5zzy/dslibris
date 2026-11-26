@@ -158,3 +158,140 @@ void DictUI::Reset() {
     viewTouchDragged = false;
 }
 
+u8 DictUI::GetTouchScreenIdx(const App* app) const {
+    // When orientation == false (Turned Left), Sub (screenright = 1) is the physical touch screen.
+    // When orientation == true (Turned Right), lcdSwap() puts Main (screenleft = 0) on the physical touch screen.
+    return app->orientation ? 0 : 1;
+}
+
+bool DictUI::IsInInnerGutter(const App* app, u16 ux) const {
+    if (app->orientation) {
+        // Touch screen is left page; hinge/gutter is on its right edge.
+        return ux >= static_cast<u16>(app->ts->display.width - app->ts->margin.right - 2);
+    } else {
+        // Touch screen is right page; hinge/gutter is on its left edge.
+        return ux <= static_cast<u16>(app->ts->margin.left + 2);
+    }
+}
+
+bool DictUI::IsInOuterEdge(const App* app, u16 ux) const {
+    if (app->orientation) {
+        // Touch screen is left page; outer edge away from hinge is on its left edge.
+        return ux <= static_cast<u16>(app->ts->margin.left);
+    } else {
+        // Touch screen is right page; outer edge away from hinge is on its right edge.
+        return ux >= static_cast<u16>(app->ts->display.width - app->ts->margin.right);
+    }
+}
+
+bool DictUI::IsInCancelZone(const App* app, u16 uy) const {
+    return uy >= static_cast<u16>(app->ts->display.height - app->ts->margin.bottom);
+}
+
+int DictUI::FindNearestWord(const App* app, u8 screenIdx, u16 ux, u16 uy) const {
+    int bestIdx = -1;
+    int bestDist = 0x7FFFFFFF;
+
+    for (size_t i = 0; i < app->pageWords.size(); i++) {
+        const WordBox& wb = app->pageWords[i];
+        if (wb.screenIdx != screenIdx) continue;
+
+        int x0 = wb.x;
+        int x1 = wb.x + wb.w;
+        int y0 = wb.y;
+        int y1 = wb.y + wb.h;
+
+        int dx = 0;
+        if (ux < x0) dx = x0 - ux;
+        else if (ux > x1) dx = ux - x1;
+
+        int dy = 0;
+        if (uy < y0) dy = y0 - uy;
+        else if (uy > y1) dy = uy - y1;
+
+        // Direct hit inside bounding box wins immediately.
+        if (dx == 0 && dy == 0) return static_cast<int>(i);
+
+        // Weight vertical distance slightly higher so dragging stays on the intended line.
+        int dist = dx * dx + (dy * 2) * (dy * 2);
+        if (dist < bestDist) {
+            bestDist = dist;
+            bestIdx = static_cast<int>(i);
+        }
+    }
+    return bestIdx;
+}
+
+void DictUI::ClearHighlight(App* app) {
+    if (!hasHighlight) return;
+    u16* fb = (hlScreenIdx == 0) ? app->ts->screenleft : app->ts->screenright;
+    int stride = app->ts->display.height; // 256
+    int idx = 0;
+    for (u16 y = hlY; y < hlY + hlH; y++) {
+        for (u16 x = hlX; x < hlX + hlW; x++) {
+            fb[y * stride + x] = savedPixels[idx++];
+        }
+    }
+    hasHighlight = false;
+}
+
+void DictUI::ApplyHighlight(App* app, int wordIdx) {
+    if (wordIdx == selectedWordIdx && hasHighlight) return;
+    ClearHighlight(app);
+    selectedWordIdx = wordIdx;
+    if (wordIdx < 0 || wordIdx >= static_cast<int>(app->pageWords.size())) return;
+
+    const WordBox& wb = app->pageWords[wordIdx];
+    u16 x0 = (wb.x > 1) ? (wb.x - 1) : 0;
+    u16 y0 = (wb.y > 0) ? wb.y : 0;
+    u16 x1 = static_cast<u16>(std::min<int>(app->ts->display.width, wb.x + wb.w + 1));
+    u16 y1 = static_cast<u16>(std::min<int>(app->ts->display.height, wb.y + wb.h));
+    if (x1 <= x0 || y1 <= y0) return;
+
+    u16 w = x1 - x0;
+    u16 h = y1 - y0;
+    if (static_cast<int>(w) * static_cast<int>(h) > kMaxHighlightPx) {
+        h = static_cast<u16>(kMaxHighlightPx / w);
+    }
+
+    u16* fb = (wb.screenIdx == 0) ? app->ts->screenleft : app->ts->screenright;
+    int stride = app->ts->display.height;
+    bool inv = app->ts->GetInvert();
+
+    int idx = 0;
+    for (u16 y = y0; y < y0 + h; y++) {
+        for (u16 x = x0; x < x0 + w; x++) {
+            u16 orig = fb[y * stride + x];
+            savedPixels[idx++] = orig;
+            fb[y * stride + x] = BlendHighlight(orig, inv);
+        }
+    }
+
+    hlScreenIdx = wb.screenIdx;
+    hlX = x0;
+    hlY = y0;
+    hlW = w;
+    hlH = h;
+    hasHighlight = true;
+}
+
+void DictUI::DrawSelectHint(App* app, const char* msg) {
+    u16* prevScreen = app->ts->GetScreen();
+    int prevStyle = app->ts->GetStyle();
+    bool prevInv = app->ts->GetInvert();
+
+    // Draw hint in bottom status strip of screenleft (same area as UpdateClock/PrintStatus).
+    app->ts->SetScreen(app->ts->screenleft);
+    app->ts->SetStyle(TEXT_STYLE_BROWSER);
+    app->ts->ClearRect(0, 240, app->ts->display.width, app->ts->display.height);
+    app->ts->SetPen(6, 252);
+    if (msg && msg[0]) {
+        bool b = false, it = false;
+        DrawStyledText(app, app->ts->screenleft, 6, 252, msg, app->ts->display.width - 4, false, false, b, it);
+    }
+
+    app->ts->SetInvert(prevInv);
+    app->ts->SetStyle(prevStyle);
+    app->ts->SetScreen(prevScreen);
+}
+
