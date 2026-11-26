@@ -12,13 +12,15 @@
  GNU General Public License for more details.
  
  You should have received a copy of the GNU General Public License
- along with this program; if not, write to the Free Software
- Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
+ along with this program; if not, write to the Free Software Foundation,
+ Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
  
  To contact the copyright holder: rayh23@sourceforge.net
  */
 
 #include "page.h"
+#include "app.h"
+#include "dict_lookup.h"
 
 #include <string.h>
 #include <list>
@@ -52,13 +54,39 @@ void Page::Cache(FILE *fp)
 	fwrite((const char*)buf, 1, strlen((char*)buf), fp);
 }
 
-#if 0
-void Page::Draw()
+std::string Page::ExtractWord(const WordBox& box) const
 {
-	Text *ts = book->app->ts;
-	if(ts) Draw(ts);
+	if (!buf || box.bufStart >= length) return std::string();
+
+	if (!box.isCjk) {
+		int avail = length - box.bufStart;
+		int take = (box.bufLen < avail) ? box.bufLen : avail;
+		return std::string(reinterpret_cast<const char*>(buf + box.bufStart), take);
+	}
+
+	// CJK: gather up to 8 characters starting from bufStart for longest-prefix lookup.
+	std::string out;
+	int pos = box.bufStart;
+	int chars = 0;
+	while (pos < length && chars < 8) {
+		u8 b = buf[pos];
+		if (b == '\n' || b == ' ' || b == '\t') break;
+		if (b == TEXT_BOLD_ON || b == TEXT_BOLD_OFF ||
+		    b == TEXT_ITALIC_ON || b == TEXT_ITALIC_OFF) {
+			pos++;
+			continue;
+		}
+		uint32_t cp = 0;
+		size_t step = DictText::Utf8Decode(reinterpret_cast<const char*>(buf + pos),
+		                                   static_cast<size_t>(length - pos), &cp);
+		if (step == 0) break;
+		if (DictText::IsPunctCodepoint(cp)) break;
+		out.append(reinterpret_cast<const char*>(buf + pos), step);
+		pos += static_cast<int>(step);
+		chars++;
+	}
+	return out;
 }
-#endif
 
 void Page::Draw(Text *ts)
 {
@@ -69,24 +97,52 @@ void Page::Draw(Text *ts)
 	ts->italic = false;
 	ts->bold = false;
 
-#ifdef OFFSCREEN
-	// Draw offscreen.
-	auto pushscreen = ts->screen;
+	App* app = book ? book->GetApp() : nullptr;
+	std::vector<WordBox>* words = app ? &app->pageWords : nullptr;
+	if (words) {
+		words->clear();
+	}
+
+	// Double-buffer each screen in ts->offscreen and blit during VBlank to avoid flicker.
+	u16* pushscreen = ts->GetScreen();
 	ts->SetScreen(ts->offscreen);
-#else
-	ts->SetScreen(ts->screenleft);
-#endif
-	ts->SetScreen(ts->screenright);
-	ts->ClearScreen();
-	ts->SetScreen(ts->screenleft);
 	ts->ClearScreen();
 
-	u16 i=0;
-	while (i<length)
+	// Track active word bounding box while rendering.
+	bool inWord = false;
+	WordBox curWord = {};
+	u8 lineH = ts->GetHeight();
+	if (lineH < 6) lineH = 12;
+
+	auto flushWord = [&]() {
+		if (!inWord) return;
+		inWord = false;
+		if (!words || curWord.bufLen == 0 || curWord.w == 0) return;
+		// Skip standalone punctuation tokens.
+		std::string raw(reinterpret_cast<const char*>(buf + curWord.bufStart), curWord.bufLen);
+		if (!DictText::CleanToken(raw).empty()) {
+			words->push_back(curWord);
+		}
+	};
+
+	auto computeBoxY = [&](u8 baselineY, u8& outY, u8& outH) {
+		int asc = (lineH * 4) / 5 + 1;
+		int top = static_cast<int>(baselineY) - asc;
+		if (top < 0) top = 0;
+		int h = static_cast<int>(lineH) + 2;
+		if (top + h > ts->display.height) h = ts->display.height - top;
+		outY = static_cast<u8>(top);
+		outH = static_cast<u8>(h > 0 ? h : 1);
+	};
+
+	u8 curScreenIdx = 0;
+	u16 i = 0;
+	while (i < length)
 	{
 		u32 c = buf[i];
 		if (c == '\n')
 		{
+			flushWord();
 			// line break, page breaking if necessary
 			i++;
 			
@@ -94,14 +150,10 @@ void Page::Draw(Text *ts)
 				> ts->display.height - ts->margin.bottom)
 			{
 				// Move to right page
-				if(ts->GetScreen() == ts->screenleft) {
-#ifdef OFFSCREEN
-					ts->SetScreen(ts->screenleft);
-					ts->CopyScreen(ts->offscreen, ts->screen);
+				if (curScreenIdx == 0) {
+					ts->CopyScreen(ts->offscreen, ts->screenleft);
+					curScreenIdx = 1;
 					ts->SetScreen(ts->offscreen);
-#else
-					ts->SetScreen(ts->screenright);
-#endif
 					ts->ClearScreen();
 					ts->InitPen();
 					ts->linebegan = false;
@@ -115,21 +167,31 @@ void Page::Draw(Text *ts)
 		} else if (c == TEXT_BOLD_ON) {
 			i++;
 			ts->bold = true;
+			if (inWord) curWord.bufLen = i - curWord.bufStart;
 		} else if (c == TEXT_BOLD_OFF) {
 			i++;
 			ts->bold = false;
+			if (inWord) curWord.bufLen = i - curWord.bufStart;
 		} else if (c == TEXT_ITALIC_ON) {
 			i++;
 			ts->italic = true;
+			if (inWord) curWord.bufLen = i - curWord.bufStart;
 		} else if (c == TEXT_ITALIC_OFF) {
 			i++;
 			ts->italic = false;
+			if (inWord) curWord.bufLen = i - curWord.bufStart;
 		} else {
-			if (c > 127)
-				i+=ts->GetCharCode((char*)&(buf[i]),&c);
-			else
+			u16 charStart = i;
+			if (c > 127) {
+				u8 step = ts->GetCharCode((char*)&(buf[i]), &c);
+				i += (step > 0) ? step : 1;
+			} else {
 				i++;
-			
+			}
+
+			u8 penXBefore = ts->GetPenX();
+			u8 penYBefore = ts->GetPenY();
+
 			if (ts->bold && ts->italic)
 				ts->PrintChar(c, TEXT_STYLE_BOLDITALIC);
 			else if (ts->italic)
@@ -138,17 +200,61 @@ void Page::Draw(Text *ts)
 				ts->PrintChar(c, TEXT_STYLE_BOLD);
 			else
 				ts->PrintChar(c, TEXT_STYLE_REGULAR);
-			
+
+			u8 penXAfter = ts->GetPenX();
 			ts->linebegan = true;
+
+			if (words) {
+				if (c == ' ' || c == '\t') {
+					flushWord();
+				} else if (DictText::IsCjkCodepoint(c)) {
+					flushWord();
+					if (!DictText::IsPunctCodepoint(c)) {
+						WordBox cjk = {};
+						cjk.bufStart = charStart;
+						cjk.bufLen = i - charStart;
+						cjk.screenIdx = curScreenIdx;
+						cjk.x = penXBefore;
+						computeBoxY(penYBefore, cjk.y, cjk.h);
+						int w = static_cast<int>(penXAfter) - static_cast<int>(penXBefore);
+						cjk.w = static_cast<u8>(w > 0 ? w : lineH);
+						cjk.isCjk = true;
+						words->push_back(cjk);
+					}
+				} else {
+					if (!inWord) {
+						inWord = true;
+						curWord = {};
+						curWord.bufStart = charStart;
+						curWord.bufLen = i - charStart;
+						curWord.screenIdx = curScreenIdx;
+						curWord.x = penXBefore;
+						computeBoxY(penYBefore, curWord.y, curWord.h);
+						int w = static_cast<int>(penXAfter) - static_cast<int>(penXBefore);
+						curWord.w = static_cast<u8>(w > 0 ? w : 1);
+						curWord.isCjk = false;
+					} else {
+						curWord.bufLen = i - curWord.bufStart;
+						int w = static_cast<int>(penXAfter) - static_cast<int>(curWord.x);
+						if (w > 0) curWord.w = static_cast<u8>(w < 255 ? w : 255);
+					}
+				}
+			}
 		}
 	}
 
+	flushWord();
+
+	if (curScreenIdx == 0) {
+		// Short page fit entirely on left screen; blit left and prepare blank right screen.
+		ts->CopyScreen(ts->offscreen, ts->screenleft);
+		ts->SetScreen(ts->offscreen);
+		ts->ClearScreen();
+	}
+
 	DrawNumber(ts);
-#ifdef OFFSCREEN
-	ts->SetScreen(ts->screenright);
-	ts->CopyScreen(ts->offscreen, ts->screen);
+	ts->CopyScreen(ts->offscreen, ts->screenright);
 	ts->SetScreen(pushscreen);
-#endif
 }
 
 void Page::DrawNumber(Text *ts)
@@ -200,7 +306,6 @@ void Page::DrawNumber(Text *ts)
 		location = ts->margin.left
 			+ (int)((float)region * (float)pagecurrent / (float)(pagecount-1));
 
-	ts->SetScreen(ts->screenright);
 	ts->SetPen((u8)location,250);
 	ts->PrintString(msg);
 }
