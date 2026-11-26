@@ -717,3 +717,175 @@ bool StarDict::FindWord(const std::string& word, StarDictEntry& outEntry,
     return false;
 }
 
+bool StarDict::FindSynonym(const std::string& word, StarDictEntry& outEntry) {
+    if (!info.hasSyn || !synFile || word.empty()) return false;
+    if (!EnsureSynIndexed()) return false;
+
+    int lo = 0;
+    int hi = static_cast<int>(synCheckpoints.size()) - 1;
+    int block = 0;
+
+    while (lo <= hi) {
+        int mid = lo + (hi - lo) / 2;
+        std::string w;
+        uint32_t origIdx = 0;
+        uint32_t nextOff = 0;
+        if (!ReadSynEntryAt(synCheckpoints[mid].fileOffset, w, origIdx, nextOff)) return false;
+        int cmp = AsciiStrCaseCmp(w.c_str(), word.c_str());
+        if (cmp <= 0) {
+            block = mid;
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+
+    while (block > 0) {
+        std::string w;
+        uint32_t origIdx = 0;
+        uint32_t nextOff = 0;
+        if (!ReadSynEntryAt(synCheckpoints[block].fileOffset, w, origIdx, nextOff)) break;
+        if (AsciiStrCaseCmp(w.c_str(), word.c_str()) == 0) {
+            block--;
+        } else {
+            break;
+        }
+    }
+
+    uint64_t synSize = GetFileSize(info.synPath);
+    bool foundCI = false;
+    uint32_t bestOrigIdx = 0;
+
+    for (int b = block; b < static_cast<int>(synCheckpoints.size()); b++) {
+        uint32_t startOff = synCheckpoints[b].fileOffset;
+        uint32_t endOff = (b + 1 < static_cast<int>(synCheckpoints.size()))
+                              ? synCheckpoints[b + 1].fileOffset
+                              : static_cast<uint32_t>(synSize);
+        if (endOff <= startOff) break;
+
+        size_t span = endOff - startOff;
+        std::vector<unsigned char> buf(span);
+        if (fseek(synFile, static_cast<long>(startOff), SEEK_SET) != 0) return false;
+        size_t got = fread(buf.data(), 1, span, synFile);
+
+        size_t p = 0;
+        bool passed = false;
+        while (p < got) {
+            size_t nul = p;
+            while (nul < got && buf[nul] != 0) nul++;
+            if (nul + 5 > got) break;
+
+            const char* synWord = reinterpret_cast<const char*>(buf.data() + p);
+            int ci = AsciiStrCaseCmp(synWord, word.c_str());
+            if (ci == 0) {
+                uint32_t origIdx = ReadBE32(buf.data() + nul + 1);
+                if (!foundCI) {
+                    bestOrigIdx = origIdx;
+                    foundCI = true;
+                }
+                if (strcmp(synWord, word.c_str()) == 0) {
+                    return GetEntryByIndex(origIdx, outEntry);
+                }
+            } else if (ci > 0) {
+                passed = true;
+                break;
+            }
+            p = nul + 5;
+        }
+        if (passed) break;
+        if (!foundCI && b + 1 < static_cast<int>(synCheckpoints.size())) {
+            std::string nextFirst;
+            uint32_t dummyIdx = 0, dummyNext = 0;
+            if (!ReadSynEntryAt(synCheckpoints[b + 1].fileOffset, nextFirst, dummyIdx, dummyNext) ||
+                AsciiStrCaseCmp(nextFirst.c_str(), word.c_str()) > 0) {
+                break;
+            }
+        }
+    }
+
+    if (foundCI) {
+        return GetEntryByIndex(bestOrigIdx, outEntry);
+    }
+    return false;
+}
+
+bool StarDict::ReadDictZipRange(uint64_t offset, uint32_t size, std::string& out) {
+    if (dzChunkLen == 0 || dzChunkOffsets.size() < 2) return false;
+    if (size == 0) {
+        out.clear();
+        return true;
+    }
+
+    uint32_t numChunks = static_cast<uint32_t>(dzChunkOffsets.size() - 1);
+    uint32_t firstChunk = static_cast<uint32_t>(offset / dzChunkLen);
+    uint32_t lastChunk = static_cast<uint32_t>((offset + size - 1) / dzChunkLen);
+    if (firstChunk >= numChunks || lastChunk >= numChunks) return false;
+
+    out.clear();
+    out.reserve(size);
+
+    std::vector<unsigned char> compBuf;
+    std::vector<unsigned char> uncompBuf(dzChunkLen);
+
+    for (uint32_t c = firstChunk; c <= lastChunk; c++) {
+        uint32_t compStart = dzChunkOffsets[c];
+        uint32_t compLen = dzChunkOffsets[c + 1] - compStart;
+        if (compLen == 0) return false;
+
+        compBuf.resize(compLen);
+        if (fseek(dictFile, static_cast<long>(compStart), SEEK_SET) != 0) return false;
+        if (fread(compBuf.data(), 1, compLen, dictFile) != compLen) return false;
+
+        z_stream zs;
+        memset(&zs, 0, sizeof(zs));
+        if (inflateInit2(&zs, -MAX_WBITS) != Z_OK) return false;
+
+        zs.next_in = compBuf.data();
+        zs.avail_in = compLen;
+        zs.next_out = uncompBuf.data();
+        zs.avail_out = dzChunkLen;
+
+        int ret = inflate(&zs, Z_FINISH);
+        size_t produced = dzChunkLen - zs.avail_out;
+        inflateEnd(&zs);
+
+        if (ret != Z_OK && ret != Z_STREAM_END && ret != Z_BUF_ERROR) {
+            return false;
+        }
+        if (produced == 0) return false;
+
+        uint64_t chunkUncompStart = static_cast<uint64_t>(c) * dzChunkLen;
+        uint64_t sliceStart = (offset > chunkUncompStart) ? (offset - chunkUncompStart) : 0;
+        uint64_t wantEnd = offset + size;
+        uint64_t chunkUncompEnd = chunkUncompStart + produced;
+        uint64_t sliceEnd = (wantEnd < chunkUncompEnd) ? (wantEnd - chunkUncompStart) : produced;
+
+        if (sliceStart < sliceEnd && sliceEnd <= produced) {
+            out.append(reinterpret_cast<const char*>(uncompBuf.data() + sliceStart),
+                       static_cast<size_t>(sliceEnd - sliceStart));
+        }
+    }
+
+    return out.size() == size;
+}
+
+bool StarDict::ReadRawDefinition(const StarDictEntry& entry, std::string& outRaw) {
+    if (!dictFile) return false;
+    if (entry.dataSize == 0) {
+        outRaw.clear();
+        return true;
+    }
+    // Sanity cap to protect DS RAM (64 KB max single entry).
+    uint32_t cappedSize = (entry.dataSize > 65536) ? 65536 : entry.dataSize;
+
+    if (info.isDictZip) {
+        return ReadDictZipRange(entry.dataOffset, cappedSize, outRaw);
+    }
+
+    if (fseek(dictFile, static_cast<long>(entry.dataOffset), SEEK_SET) != 0) return false;
+    outRaw.resize(cappedSize);
+    size_t got = fread(&outRaw[0], 1, cappedSize, dictFile);
+    outRaw.resize(got);
+    return got > 0;
+}
+
