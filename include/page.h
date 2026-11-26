@@ -12,8 +12,8 @@
  GNU General Public License for more details.
  
  You should have received a copy of the GNU General Public License
- along with this program; if not, write to the Free Software
- Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
+ along with this program; if not, write to the Free Software Foundation,
+ Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
  
  To contact the copyright holder: rayh23@sourceforge.net
  */
@@ -26,8 +26,20 @@ A Book contains a vector of Pages.
 #pragma once
 
 #include <nds.h>
+#include <string>
 #include "book.h"
 #include "text.h"
+
+struct WordBox {
+	u16 bufStart;
+	u16 bufLen;
+	u8 screenIdx; // 0 = screenleft, 1 = screenright
+	u8 x;
+	u8 y;
+	u8 w;
+	u8 h;
+	bool isCjk;
+};
 
 class Page {
 	class Book *book;
@@ -50,6 +62,7 @@ class Page {
 	//! Copy src to buf for len bytes.
 	u8   SetBuffer(u8 *src, u16 len); 
 	void Cache(FILE *fp);
-//	void Draw();
 	void Draw(Text *ts);
+	//! Extract raw UTF-8 token (or up to 8-char CJK window) for dictionary lookup.
+	std::string ExtractWord(const WordBox& box) const;
 };

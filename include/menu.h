@@ -6,7 +6,7 @@
 class Menu {
 public:
     Menu(class App *app);
-    ~Menu();
+    virtual ~Menu();
     virtual void Draw() = 0; // Draw the menu on the screen
     u8 GetCurrentPage() const;
     u8 GetPageCount() const;

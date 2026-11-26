@@ -36,6 +36,7 @@ Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
 #include "parse.h"
 #include "book.h"
 #include "button.h"
+#include "dict_menu.h"
 #include "font.h"
 #include "text.h"
 #include "version.h"
@@ -52,6 +53,7 @@ App::App()
 
 	fontdir = std::string("font");
 	bookdir = std::string("book");
+	dictdir = std::string("dictionary");
 	bookcount = 0;
 	bookselected = NULL;
 	bookcurrent = NULL;
@@ -88,10 +90,12 @@ App::App()
 	ts->app = this;
 
 	fontmenu = new FontMenu(this);
+	dictmenu = nullptr;
 }
 
 App::~App()
 {
+	if (dictmenu) delete dictmenu;
 	if (prefs) delete prefs;
 	if (ts) delete ts;
 	for(std::vector<Book*>::iterator it=books.begin();it!=books.end();it++)
@@ -135,6 +139,13 @@ int App::Run(void)
 		book->Index();
 		book->GetBookmarks()->sort();
 	}
+
+	// Scan Dictionary/ folder for StarDict dictionaries.
+	dictManager.ScanDirectory(dictdir);
+	if (!dictfile.empty()) {
+		dictManager.SelectByPath(dictfile);
+	}
+	dictmenu = new DictMenu(this);
 
 	// Set up menus.
 
@@ -184,6 +195,21 @@ int App::Run(void)
 			case APP_MODE_PREFS_FONT_BOLDITALIC:
 			fontmenu->handleInput();
 			if (fontmenu->isDirty()) fontmenu->draw();
+			break;
+
+			case APP_MODE_PREFS_DICT:
+			if (dictmenu) {
+				dictmenu->handleInput();
+				if (dictmenu->isDirty()) dictmenu->draw();
+			}
+			break;
+
+			case APP_MODE_DICT_SELECT:
+			dictUI.HandleSelectEvent(this);
+			break;
+
+			case APP_MODE_DICT_VIEW:
+			dictUI.HandleViewEvent(this);
 			break;
 		}
 	}
@@ -263,6 +289,14 @@ void App::ShowLibraryView()
 	buttonprefs.Label("settings");
 	ts->SetScreen(ts->screenright);
 	browser_view_dirty = true;
+}
+
+void App::ShowDictView()
+{
+	mode = APP_MODE_PREFS_DICT;
+	buttonprefs.Label("cancel");
+	ts->SetScreen(ts->screenright);
+	if (dictmenu) dictmenu->setDirty();
 }
 
 void App::ShowSettingsView()

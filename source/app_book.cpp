@@ -26,6 +26,32 @@ void App::HandleEventInBook()
 	u16 pagecurrent = bookcurrent->GetPosition();
 	u16 pagecount = bookcurrent->GetPageCount();
 
+	bool turnPrev = false;
+	bool turnNext = false;
+	bool toggleBm = false;
+	if (dictUI.HandleBookInput(this, turnPrev, turnNext, toggleBm))
+	{
+		if (mode != APP_MODE_BOOK) return;
+		if (turnPrev) {
+			if (pagecurrent > 0) {
+				pagecurrent--;
+				bookcurrent->SetPosition(pagecurrent);
+				bookcurrent->GetPage()->Draw(ts);
+			}
+			prefs->Write();
+		} else if (turnNext) {
+			if (pagecurrent < pagecount - 1) {
+				pagecurrent++;
+				bookcurrent->SetPosition(pagecurrent);
+				bookcurrent->GetPage()->Draw(ts);
+			}
+			prefs->Write();
+		} else if (toggleBm) {
+			ToggleBookmark();
+		}
+		return;
+	}
+
 	auto keys = keysDown();
 
 	if (keys & (KEY_A|key.r|key.down))
@@ -56,36 +82,14 @@ void App::HandleEventInBook()
 		ts->SetInvert(!ts->GetInvert());
 		bookcurrent->GetPage()->Draw(ts);
 	}
-	else if (keys & (KEY_SELECT|KEY_Y))
+	else if (keys & KEY_SELECT)
 	{
 		ToggleBookmark();
 	}
-	else if (keys & KEY_TOUCH)
-	{
-		// Turn page.
-		touchPosition coord = TouchRead();
-		if (coord.py < 95)
-		{
-			if (pagecurrent > 0)
-			{
-				pagecurrent--;
-				bookcurrent->SetPosition(pagecurrent);
-				bookcurrent->GetPage()->Draw(ts);
-			}
-		}
-		else
-		{
-			if (pagecurrent < pagecount-1)
-			{
-				pagecurrent++;
-				bookcurrent->SetPosition(pagecurrent);
-				bookcurrent->GetPage()->Draw(ts);
-			}
-		}
-		prefs->Write();
-	}
 	else if (keys & KEY_START)
 	{
+		dictUI.Reset();
+		pageWords.clear();
 		bookcurrent->Close();
 		bookcurrent = nullptr;
 
@@ -163,6 +167,8 @@ void App::ToggleBookmark() {
 
 void App::CloseBook()
 {
+	dictUI.Reset();
+	pageWords.clear();
 	if (!bookcurrent) return;
 	bookcurrent->Close();
 	bookcurrent = NULL;
@@ -201,6 +207,7 @@ u8 App::OpenBook(void)
 		mode = APP_MODE_BOOK;
 	}
 	PrintStatus("");
+	dictUI.Reset();
 	if(bookcurrent->GetPosition() >= bookcurrent->GetPageCount())
 		bookcurrent->SetPosition(0);
 	bookcurrent->GetPage()->Draw(ts);

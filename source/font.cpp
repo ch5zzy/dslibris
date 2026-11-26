@@ -130,19 +130,30 @@ void FontMenu::handleTouchInput() {
 
 void FontMenu::draw()
 {
+	bool invert = app->ts->GetInvert();
+	u16* screen = app->ts->GetScreen();
+	int style = app->ts->GetStyle();
+
+	app->ts->SetScreen(app->ts->screenright);
+	app->ts->SetInvert(false);
+	app->ts->SetStyle(TEXT_STYLE_BROWSER);
 	app->ts->ClearScreen();
 	for (u8 i = page * pagesize;
 		(i < buttons.size()) && (i < (page + 1) * pagesize);
 		i++)
 	{
-		buttons[i]->Draw(i == selected);
+		buttons[i]->Draw(app->ts->screenright, i == selected);
 	}
 	if(page > 0)
-		app->buttonprev.Draw();
+		app->buttonprev.Draw(app->ts->screenright, false);
 	app->buttonprefs.Label("cancel");
-	app->buttonprefs.Draw();
+	app->buttonprefs.Draw(app->ts->screenright, false);
 	if(page < GetPageCount() - 1)
-		app->buttonnext.Draw();
+		app->buttonnext.Draw(app->ts->screenright, false);
+
+	app->ts->SetStyle(style);
+	app->ts->SetInvert(invert);
+	app->ts->SetScreen(screen);
 	dirty = false;
 }
 

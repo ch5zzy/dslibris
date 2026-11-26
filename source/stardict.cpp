@@ -1,0 +1,1137 @@
+#include "stardict.h"
+
+#include <algorithm>
+#include <cstring>
+#include <cstdlib>
+#include <sys/stat.h>
+#include <zlib.h>
+
+namespace {
+
+static const uint32_t kMaxCheckpoints = 2048;
+static const uint32_t kMinBlockBytes = 4096;
+static const size_t   kScanBufSize = 8192;
+
+static bool FileExists(const std::string& path) {
+    struct stat st;
+    return stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode);
+}
+
+static uint64_t GetFileSize(const std::string& path) {
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0) return 0;
+    return static_cast<uint64_t>(st.st_size);
+}
+
+static inline unsigned char AsciiToLower(unsigned char c) {
+    return (c >= 'A' && c <= 'Z') ? static_cast<unsigned char>(c - 'A' + 'a') : c;
+}
+
+static uint32_t ReadBE32(const unsigned char* p) {
+    return (static_cast<uint32_t>(p[0]) << 24) |
+           (static_cast<uint32_t>(p[1]) << 16) |
+           (static_cast<uint32_t>(p[2]) << 8)  |
+           (static_cast<uint32_t>(p[3]));
+}
+
+static uint64_t ReadBE64(const unsigned char* p) {
+    return (static_cast<uint64_t>(ReadBE32(p)) << 32) |
+           static_cast<uint64_t>(ReadBE32(p + 4));
+}
+
+static uint16_t ReadLE16(const unsigned char* p) {
+    return static_cast<uint16_t>(p[0]) | (static_cast<uint16_t>(p[1]) << 8);
+}
+
+static void AppendUtf8(std::string& out, uint32_t cp) {
+    if (cp == 0) return;
+    if (cp < 0x80) {
+        out.push_back(static_cast<char>(cp));
+    } else if (cp < 0x800) {
+        out.push_back(static_cast<char>(0xC0 | (cp >> 6)));
+        out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    } else if (cp < 0x10000) {
+        out.push_back(static_cast<char>(0xE0 | (cp >> 12)));
+        out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    } else if (cp <= 0x10FFFF) {
+        out.push_back(static_cast<char>(0xF0 | (cp >> 18)));
+        out.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    }
+}
+
+static std::string TrimLine(const std::string& s) {
+    size_t start = 0;
+    while (start < s.size() && (s[start] == ' ' || s[start] == '\t' || s[start] == '\r' || s[start] == '\n'))
+        start++;
+    size_t end = s.size();
+    while (end > start && (s[end - 1] == ' ' || s[end - 1] == '\t' || s[end - 1] == '\r' || s[end - 1] == '\n'))
+        end--;
+    return s.substr(start, end - start);
+}
+
+static int AsciiStrCaseCmp(const char* a, const char* b) {
+    const unsigned char* pa = reinterpret_cast<const unsigned char*>(a);
+    const unsigned char* pb = reinterpret_cast<const unsigned char*>(b);
+    while (*pa && *pb) {
+        int ca = AsciiToLower(*pa);
+        int cb = AsciiToLower(*pb);
+        if (ca != cb) return ca - cb;
+        pa++;
+        pb++;
+    }
+    return static_cast<int>(AsciiToLower(*pa)) - static_cast<int>(AsciiToLower(*pb));
+}
+
+} // namespace
+
+StarDict::StarDict()
+    : idxFile(nullptr),
+      dictFile(nullptr),
+      synFile(nullptr),
+      idxIndexed(false),
+      synIndexed(false),
+      dzChunkLen(0) {}
+
+StarDict::~StarDict() {
+    Close();
+}
+
+int StarDict::CompareKeys(const char* a, const char* b) {
+    int cmp = AsciiStrCaseCmp(a, b);
+    if (cmp != 0) return cmp;
+    return strcmp(a, b);
+}
+
+bool StarDict::ParseIfo(const std::string& ifoPath, StarDictInfo& out) {
+    out = StarDictInfo();
+    out.ifoPath = ifoPath;
+
+    FILE* fp = fopen(ifoPath.c_str(), "rb");
+    if (!fp) return false;
+
+    char lineBuf[512];
+    bool validHeader = false;
+    while (fgets(lineBuf, sizeof(lineBuf), fp)) {
+        std::string line = TrimLine(lineBuf);
+        if (line.empty()) continue;
+        if (!validHeader) {
+            // Strip optional UTF-8 BOM
+            if (line.size() >= 3 &&
+                static_cast<unsigned char>(line[0]) == 0xEF &&
+                static_cast<unsigned char>(line[1]) == 0xBB &&
+                static_cast<unsigned char>(line[2]) == 0xBF) {
+                line.erase(0, 3);
+            }
+            if (line == "StarDict's dict ifo file") {
+                validHeader = true;
+                continue;
+            }
+            fclose(fp);
+            return false;
+        }
+        size_t eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        std::string key = TrimLine(line.substr(0, eq));
+        std::string val = TrimLine(line.substr(eq + 1));
+
+        if (key == "bookname") {
+            out.bookName = val;
+        } else if (key == "wordcount") {
+            out.wordCount = static_cast<uint32_t>(strtoul(val.c_str(), nullptr, 10));
+        } else if (key == "synwordcount") {
+            out.synWordCount = static_cast<uint32_t>(strtoul(val.c_str(), nullptr, 10));
+        } else if (key == "idxfilesize") {
+            out.idxFileSize = static_cast<uint64_t>(strtoull(val.c_str(), nullptr, 10));
+        } else if (key == "idxoffsetbits") {
+            int bits = atoi(val.c_str());
+            out.idxOffsetBits = (bits == 64) ? 64 : 32;
+        } else if (key == "sametypesequence") {
+            out.sameTypeSequence = val;
+        }
+    }
+    fclose(fp);
+
+    if (!validHeader || ifoPath.size() < 4) return false;
+
+    std::string base = ifoPath.substr(0, ifoPath.size() - 4);
+    out.idxPath = base + ".idx";
+    if (!FileExists(out.idxPath)) return false;
+
+    if (out.idxFileSize == 0) {
+        out.idxFileSize = GetFileSize(out.idxPath);
+    }
+
+    std::string dzPath = base + ".dict.dz";
+    std::string rawDictPath = base + ".dict";
+    if (FileExists(dzPath)) {
+        out.dictPath = dzPath;
+        out.isDictZip = true;
+    } else if (FileExists(rawDictPath)) {
+        out.dictPath = rawDictPath;
+        out.isDictZip = false;
+    } else {
+        return false;
+    }
+
+    std::string synCandidate = base + ".syn";
+    if (FileExists(synCandidate)) {
+        out.synPath = synCandidate;
+        out.hasSyn = true;
+    }
+
+    if (out.bookName.empty()) {
+        size_t slash = base.find_last_of("/\\");
+        out.bookName = (slash == std::string::npos) ? base : base.substr(slash + 1);
+    }
+
+    return true;
+}
+
+bool StarDict::Open(const std::string& ifoPath) {
+    Close();
+
+    if (!ParseIfo(ifoPath, info)) return false;
+
+    idxFile = fopen(info.idxPath.c_str(), "rb");
+    if (!idxFile) {
+        Close();
+        return false;
+    }
+
+    dictFile = fopen(info.dictPath.c_str(), "rb");
+    if (!dictFile) {
+        Close();
+        return false;
+    }
+
+    if (info.isDictZip) {
+        if (!ParseDictZipHeader()) {
+            Close();
+            return false;
+        }
+    }
+
+    if (info.hasSyn) {
+        synFile = fopen(info.synPath.c_str(), "rb");
+        if (!synFile) {
+            info.hasSyn = false;
+        }
+    }
+
+    return true;
+}
+
+void StarDict::Close() {
+    if (idxFile) {
+        fclose(idxFile);
+        idxFile = nullptr;
+    }
+    if (dictFile) {
+        fclose(dictFile);
+        dictFile = nullptr;
+    }
+    if (synFile) {
+        fclose(synFile);
+        synFile = nullptr;
+    }
+    idxCheckpoints.clear();
+    synCheckpoints.clear();
+    dzChunkOffsets.clear();
+    idxIndexed = false;
+    synIndexed = false;
+    dzChunkLen = 0;
+}
+
+bool StarDict::ParseDictZipHeader() {
+    if (!dictFile) return false;
+    if (fseek(dictFile, 0, SEEK_SET) != 0) return false;
+
+    unsigned char hdr[10];
+    if (fread(hdr, 1, 10, dictFile) != 10) return false;
+    if (hdr[0] != 0x1F || hdr[1] != 0x8B || hdr[2] != 8) return false;
+
+    unsigned char flg = hdr[3];
+    if ((flg & 0x04) == 0) return false; // FEXTRA required for dictzip
+
+    unsigned char xlenBuf[2];
+    if (fread(xlenBuf, 1, 2, dictFile) != 2) return false;
+    uint16_t xlen = ReadLE16(xlenBuf);
+
+    std::vector<unsigned char> extra(xlen);
+    if (fread(extra.data(), 1, xlen, dictFile) != xlen) return false;
+
+    bool foundRA = false;
+    size_t pos = 0;
+    std::vector<uint16_t> chunkSizes;
+    while (pos + 4 <= extra.size()) {
+        unsigned char si1 = extra[pos];
+        unsigned char si2 = extra[pos + 1];
+        uint16_t slen = ReadLE16(&extra[pos + 2]);
+        pos += 4;
+        if (pos + slen > extra.size()) break;
+
+        if (si1 == 'R' && si2 == 'A' && slen >= 6) {
+            uint16_t ver = ReadLE16(&extra[pos]);
+            if (ver != 1) return false;
+            dzChunkLen = ReadLE16(&extra[pos + 2]);
+            uint16_t chcnt = ReadLE16(&extra[pos + 4]);
+            if (dzChunkLen == 0 || static_cast<size_t>(6 + chcnt * 2) > slen) return false;
+
+            chunkSizes.resize(chcnt);
+            for (uint16_t i = 0; i < chcnt; i++) {
+                chunkSizes[i] = ReadLE16(&extra[pos + 6 + i * 2]);
+            }
+            foundRA = true;
+            break;
+        }
+        pos += slen;
+    }
+
+    if (!foundRA) return false;
+
+    // Skip optional FNAME
+    if (flg & 0x08) {
+        int c;
+        while ((c = fgetc(dictFile)) != EOF && c != 0) {}
+        if (c == EOF) return false;
+    }
+    // Skip optional FCOMMENT
+    if (flg & 0x10) {
+        int c;
+        while ((c = fgetc(dictFile)) != EOF && c != 0) {}
+        if (c == EOF) return false;
+    }
+    // Skip optional FHCRC
+    if (flg & 0x02) {
+        if (fseek(dictFile, 2, SEEK_CUR) != 0) return false;
+    }
+
+    long dataStart = ftell(dictFile);
+    if (dataStart < 0) return false;
+
+    dzChunkOffsets.resize(chunkSizes.size() + 1);
+    uint32_t cur = static_cast<uint32_t>(dataStart);
+    for (size_t i = 0; i < chunkSizes.size(); i++) {
+        dzChunkOffsets[i] = cur;
+        cur += chunkSizes[i];
+    }
+    dzChunkOffsets[chunkSizes.size()] = cur;
+    return true;
+}
+
+bool StarDict::EnsureIdxIndexed() {
+    if (idxIndexed) return !idxCheckpoints.empty();
+    if (!idxFile) return false;
+
+    idxCheckpoints.clear();
+    uint64_t fileSize = info.idxFileSize;
+    if (fileSize == 0) {
+        fileSize = GetFileSize(info.idxPath);
+        info.idxFileSize = fileSize;
+    }
+    if (fileSize == 0) return false;
+
+    uint32_t metaSize = (info.idxOffsetBits == 64) ? 12 : 8;
+    uint32_t blockBytes = static_cast<uint32_t>(fileSize / kMaxCheckpoints);
+    if (blockBytes < kMinBlockBytes) blockBytes = kMinBlockBytes;
+
+    if (fseek(idxFile, 0, SEEK_SET) != 0) return false;
+
+    std::vector<unsigned char> buf(kScanBufSize);
+    uint32_t filePos = 0;
+    uint32_t entryIdx = 0;
+    uint32_t nextCheckpointOffset = 0;
+
+    // State machine: 0 = scanning word until '\0', >0 = skipping remaining meta bytes
+    uint32_t skipMeta = 0;
+    bool atEntryStart = true;
+
+    while (true) {
+        size_t n = fread(buf.data(), 1, buf.size(), idxFile);
+        if (n == 0) break;
+
+        for (size_t i = 0; i < n; i++, filePos++) {
+            if (skipMeta > 0) {
+                skipMeta--;
+                if (skipMeta == 0) {
+                    entryIdx++;
+                    atEntryStart = true;
+                }
+                continue;
+            }
+            if (atEntryStart) {
+                if (filePos >= nextCheckpointOffset) {
+                    idxCheckpoints.push_back({filePos, entryIdx});
+                    nextCheckpointOffset = filePos + blockBytes;
+                }
+                atEntryStart = false;
+            }
+            if (buf[i] == 0) {
+                skipMeta = metaSize;
+            }
+        }
+    }
+
+    idxIndexed = true;
+    return !idxCheckpoints.empty();
+}
+
+bool StarDict::EnsureSynIndexed() {
+    if (synIndexed) return !synCheckpoints.empty();
+    if (!synFile) return false;
+
+    synCheckpoints.clear();
+    uint64_t fileSize = GetFileSize(info.synPath);
+    if (fileSize == 0) return false;
+
+    uint32_t blockBytes = static_cast<uint32_t>(fileSize / kMaxCheckpoints);
+    if (blockBytes < kMinBlockBytes) blockBytes = kMinBlockBytes;
+
+    if (fseek(synFile, 0, SEEK_SET) != 0) return false;
+
+    std::vector<unsigned char> buf(kScanBufSize);
+    uint32_t filePos = 0;
+    uint32_t entryIdx = 0;
+    uint32_t nextCheckpointOffset = 0;
+    uint32_t skipMeta = 0;
+    bool atEntryStart = true;
+
+    while (true) {
+        size_t n = fread(buf.data(), 1, buf.size(), synFile);
+        if (n == 0) break;
+
+        for (size_t i = 0; i < n; i++, filePos++) {
+            if (skipMeta > 0) {
+                skipMeta--;
+                if (skipMeta == 0) {
+                    entryIdx++;
+                    atEntryStart = true;
+                }
+                continue;
+            }
+            if (atEntryStart) {
+                if (filePos >= nextCheckpointOffset) {
+                    synCheckpoints.push_back({filePos, entryIdx});
+                    nextCheckpointOffset = filePos + blockBytes;
+                }
+                atEntryStart = false;
+            }
+            if (buf[i] == 0) {
+                skipMeta = 4;
+            }
+        }
+    }
+
+    synIndexed = true;
+    return !synCheckpoints.empty();
+}
+
+bool StarDict::ReadIdxWordAt(uint32_t fileOffset, std::string& outWord) {
+    if (fseek(idxFile, static_cast<long>(fileOffset), SEEK_SET) != 0) return false;
+    char tmp[260];
+    size_t n = fread(tmp, 1, sizeof(tmp) - 1, idxFile);
+    if (n == 0) return false;
+    tmp[n] = '\0';
+    outWord.assign(tmp);
+    return true;
+}
+
+bool StarDict::ReadIdxEntryAt(uint32_t fileOffset, uint32_t entryIndex,
+                              StarDictEntry& out, uint32_t& nextOffset) {
+    if (fseek(idxFile, static_cast<long>(fileOffset), SEEK_SET) != 0) return false;
+    unsigned char buf[280];
+    size_t n = fread(buf, 1, sizeof(buf), idxFile);
+    if (n == 0) return false;
+
+    size_t nul = 0;
+    while (nul < n && buf[nul] != 0) nul++;
+    uint32_t metaSize = (info.idxOffsetBits == 64) ? 12 : 8;
+    if (nul + 1 + metaSize > n) return false;
+
+    out.headword.assign(reinterpret_cast<const char*>(buf), nul);
+    const unsigned char* meta = buf + nul + 1;
+    if (info.idxOffsetBits == 64) {
+        out.dataOffset = ReadBE64(meta);
+        out.dataSize = ReadBE32(meta + 8);
+    } else {
+        out.dataOffset = ReadBE32(meta);
+        out.dataSize = ReadBE32(meta + 4);
+    }
+    out.entryIndex = entryIndex;
+    nextOffset = fileOffset + static_cast<uint32_t>(nul + 1 + metaSize);
+    return true;
+}
+
+bool StarDict::ReadSynEntryAt(uint32_t fileOffset, std::string& outWord,
+                              uint32_t& outOrigIndex, uint32_t& nextOffset) {
+    if (fseek(synFile, static_cast<long>(fileOffset), SEEK_SET) != 0) return false;
+    unsigned char buf[270];
+    size_t n = fread(buf, 1, sizeof(buf), synFile);
+    if (n == 0) return false;
+
+    size_t nul = 0;
+    while (nul < n && buf[nul] != 0) nul++;
+    if (nul + 5 > n) return false;
+
+    outWord.assign(reinterpret_cast<const char*>(buf), nul);
+    outOrigIndex = ReadBE32(buf + nul + 1);
+    nextOffset = fileOffset + static_cast<uint32_t>(nul + 5);
+    return true;
+}
+
+bool StarDict::GetEntryByIndex(uint32_t targetIndex, StarDictEntry& outEntry) {
+    if (!EnsureIdxIndexed()) return false;
+
+    // Binary search checkpoints by entryIndex.
+    int lo = 0;
+    int hi = static_cast<int>(idxCheckpoints.size()) - 1;
+    int block = 0;
+    while (lo <= hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (idxCheckpoints[mid].entryIndex <= targetIndex) {
+            block = mid;
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+
+    uint32_t pos = idxCheckpoints[block].fileOffset;
+    uint32_t idx = idxCheckpoints[block].entryIndex;
+    uint32_t endPos = (block + 1 < static_cast<int>(idxCheckpoints.size()))
+                          ? idxCheckpoints[block + 1].fileOffset
+                          : static_cast<uint32_t>(info.idxFileSize);
+
+    while (pos < endPos) {
+        StarDictEntry cur;
+        uint32_t nextPos = 0;
+        if (!ReadIdxEntryAt(pos, idx, cur, nextPos)) return false;
+        if (idx == targetIndex) {
+            outEntry = cur;
+            return true;
+        }
+        pos = nextPos;
+        idx++;
+    }
+    return false;
+}
+
+void StarDict::CollectNearby(int blockIdx, uint32_t targetOffset,
+                             std::vector<std::string>& nearbyOut, int maxNearby) {
+    nearbyOut.clear();
+    if (maxNearby <= 0 || idxCheckpoints.empty()) return;
+
+    int startBlock = (blockIdx > 0) ? (blockIdx - 1) : 0;
+    int endBlock = (blockIdx + 1 < static_cast<int>(idxCheckpoints.size()))
+                       ? (blockIdx + 1)
+                       : (static_cast<int>(idxCheckpoints.size()) - 1);
+
+    uint32_t startOff = idxCheckpoints[startBlock].fileOffset;
+    uint32_t endOff = (endBlock + 1 < static_cast<int>(idxCheckpoints.size()))
+                          ? idxCheckpoints[endBlock + 1].fileOffset
+                          : static_cast<uint32_t>(info.idxFileSize);
+
+    if (endOff <= startOff) return;
+    size_t span = endOff - startOff;
+    // Cap memory usage for huge blocks
+    if (span > 32768) {
+        startOff = idxCheckpoints[blockIdx].fileOffset;
+        endOff = (blockIdx + 1 < static_cast<int>(idxCheckpoints.size()))
+                     ? idxCheckpoints[blockIdx + 1].fileOffset
+                     : static_cast<uint32_t>(info.idxFileSize);
+        if (endOff <= startOff) return;
+        span = endOff - startOff;
+    }
+
+    std::vector<unsigned char> buf(span);
+    if (fseek(idxFile, static_cast<long>(startOff), SEEK_SET) != 0) return;
+    size_t got = fread(buf.data(), 1, span, idxFile);
+    if (got == 0) return;
+
+    uint32_t metaSize = (info.idxOffsetBits == 64) ? 12 : 8;
+    std::vector<std::string> words;
+    int targetPosIdx = -1;
+
+    size_t p = 0;
+    while (p < got) {
+        uint32_t curAbs = startOff + static_cast<uint32_t>(p);
+        size_t nul = p;
+        while (nul < got && buf[nul] != 0) nul++;
+        if (nul + 1 + metaSize > got) break;
+
+        if (targetPosIdx < 0 && curAbs >= targetOffset) {
+            targetPosIdx = static_cast<int>(words.size());
+        }
+        words.emplace_back(reinterpret_cast<const char*>(buf.data() + p), nul - p);
+        p = nul + 1 + metaSize;
+    }
+
+    if (words.empty()) return;
+    if (targetPosIdx < 0) targetPosIdx = static_cast<int>(words.size()) - 1;
+
+    int half = maxNearby / 2;
+    int begin = targetPosIdx - half;
+    if (begin < 0) begin = 0;
+    int end = begin + maxNearby;
+    if (end > static_cast<int>(words.size())) {
+        end = static_cast<int>(words.size());
+        begin = std::max(0, end - maxNearby);
+    }
+
+    for (int i = begin; i < end; i++) {
+        nearbyOut.push_back(words[i]);
+    }
+}
+
+bool StarDict::FindWord(const std::string& word, StarDictEntry& outEntry,
+                        std::vector<std::string>* nearbyOut, int maxNearby) {
+    if (word.empty() || !EnsureIdxIndexed()) return false;
+
+    // 1. Binary search checkpoints using ASCII case-insensitive comparison.
+    // Find the last checkpoint whose first word <= word (case-insensitively).
+    // If multiple entries share the same ASCII-lowercase key across a block boundary,
+    // step back one block so we don't miss an earlier case variant.
+    int lo = 0;
+    int hi = static_cast<int>(idxCheckpoints.size()) - 1;
+    int block = 0;
+
+    while (lo <= hi) {
+        int mid = lo + (hi - lo) / 2;
+        std::string w;
+        if (!ReadIdxWordAt(idxCheckpoints[mid].fileOffset, w)) return false;
+        int cmp = AsciiStrCaseCmp(w.c_str(), word.c_str());
+        if (cmp <= 0) {
+            block = mid;
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+
+    // Step back while previous block's start word has same case-insensitive key.
+    while (block > 0) {
+        std::string w;
+        if (!ReadIdxWordAt(idxCheckpoints[block].fileOffset, w)) break;
+        if (AsciiStrCaseCmp(w.c_str(), word.c_str()) == 0) {
+            block--;
+        } else {
+            break;
+        }
+    }
+
+    // 2. Scan the block (and if a case-insensitive match spans into the next block, check that too).
+    bool foundCaseInsensitive = false;
+    StarDictEntry bestEntry;
+    uint32_t insertionOffset = idxCheckpoints[block].fileOffset;
+    bool recordedInsertion = false;
+
+    uint32_t metaSize = (info.idxOffsetBits == 64) ? 12 : 8;
+
+    for (int b = block; b < static_cast<int>(idxCheckpoints.size()); b++) {
+        uint32_t startOff = idxCheckpoints[b].fileOffset;
+        uint32_t endOff = (b + 1 < static_cast<int>(idxCheckpoints.size()))
+                              ? idxCheckpoints[b + 1].fileOffset
+                              : static_cast<uint32_t>(info.idxFileSize);
+        if (endOff <= startOff) break;
+
+        size_t span = endOff - startOff;
+        std::vector<unsigned char> buf(span);
+        if (fseek(idxFile, static_cast<long>(startOff), SEEK_SET) != 0) return false;
+        size_t got = fread(buf.data(), 1, span, idxFile);
+
+        size_t p = 0;
+        uint32_t idx = idxCheckpoints[b].entryIndex;
+        bool passedTarget = false;
+
+        while (p < got) {
+            uint32_t curOff = startOff + static_cast<uint32_t>(p);
+            size_t nul = p;
+            while (nul < got && buf[nul] != 0) nul++;
+            if (nul + 1 + metaSize > got) break;
+
+            const char* entryWord = reinterpret_cast<const char*>(buf.data() + p);
+            int ci = AsciiStrCaseCmp(entryWord, word.c_str());
+
+            if (ci == 0) {
+                StarDictEntry cand;
+                cand.headword.assign(entryWord, nul - p);
+                const unsigned char* meta = buf.data() + nul + 1;
+                if (info.idxOffsetBits == 64) {
+                    cand.dataOffset = ReadBE64(meta);
+                    cand.dataSize = ReadBE32(meta + 8);
+                } else {
+                    cand.dataOffset = ReadBE32(meta);
+                    cand.dataSize = ReadBE32(meta + 4);
+                }
+                cand.entryIndex = idx;
+
+                if (!foundCaseInsensitive) {
+                    bestEntry = cand;
+                    foundCaseInsensitive = true;
+                    insertionOffset = curOff;
+                    recordedInsertion = true;
+                }
+                // Exact byte match wins immediately!
+                if (cand.headword == word) {
+                    outEntry = cand;
+                    if (nearbyOut) CollectNearby(b, curOff, *nearbyOut, maxNearby);
+                    return true;
+                }
+            } else if (ci > 0) {
+                if (!recordedInsertion) {
+                    insertionOffset = curOff;
+                    recordedInsertion = true;
+                }
+                passedTarget = true;
+                break;
+            }
+
+            p = nul + 1 + metaSize;
+            idx++;
+        }
+
+        if (passedTarget) break;
+        if (!foundCaseInsensitive && b + 1 < static_cast<int>(idxCheckpoints.size())) {
+            std::string nextFirst;
+            if (!ReadIdxWordAt(idxCheckpoints[b + 1].fileOffset, nextFirst) ||
+                AsciiStrCaseCmp(nextFirst.c_str(), word.c_str()) > 0) {
+                insertionOffset = endOff;
+                recordedInsertion = true;
+                break;
+            }
+        }
+    }
+
+    if (foundCaseInsensitive) {
+        outEntry = bestEntry;
+        if (nearbyOut) CollectNearby(block, insertionOffset, *nearbyOut, maxNearby);
+        return true;
+    }
+
+    if (nearbyOut) {
+        CollectNearby(block, insertionOffset, *nearbyOut, maxNearby);
+    }
+    return false;
+}
+
+bool StarDict::FindSynonym(const std::string& word, StarDictEntry& outEntry) {
+    if (!info.hasSyn || !synFile || word.empty()) return false;
+    if (!EnsureSynIndexed()) return false;
+
+    int lo = 0;
+    int hi = static_cast<int>(synCheckpoints.size()) - 1;
+    int block = 0;
+
+    while (lo <= hi) {
+        int mid = lo + (hi - lo) / 2;
+        std::string w;
+        uint32_t origIdx = 0;
+        uint32_t nextOff = 0;
+        if (!ReadSynEntryAt(synCheckpoints[mid].fileOffset, w, origIdx, nextOff)) return false;
+        int cmp = AsciiStrCaseCmp(w.c_str(), word.c_str());
+        if (cmp <= 0) {
+            block = mid;
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+
+    while (block > 0) {
+        std::string w;
+        uint32_t origIdx = 0;
+        uint32_t nextOff = 0;
+        if (!ReadSynEntryAt(synCheckpoints[block].fileOffset, w, origIdx, nextOff)) break;
+        if (AsciiStrCaseCmp(w.c_str(), word.c_str()) == 0) {
+            block--;
+        } else {
+            break;
+        }
+    }
+
+    uint64_t synSize = GetFileSize(info.synPath);
+    bool foundCI = false;
+    uint32_t bestOrigIdx = 0;
+
+    for (int b = block; b < static_cast<int>(synCheckpoints.size()); b++) {
+        uint32_t startOff = synCheckpoints[b].fileOffset;
+        uint32_t endOff = (b + 1 < static_cast<int>(synCheckpoints.size()))
+                              ? synCheckpoints[b + 1].fileOffset
+                              : static_cast<uint32_t>(synSize);
+        if (endOff <= startOff) break;
+
+        size_t span = endOff - startOff;
+        std::vector<unsigned char> buf(span);
+        if (fseek(synFile, static_cast<long>(startOff), SEEK_SET) != 0) return false;
+        size_t got = fread(buf.data(), 1, span, synFile);
+
+        size_t p = 0;
+        bool passed = false;
+        while (p < got) {
+            size_t nul = p;
+            while (nul < got && buf[nul] != 0) nul++;
+            if (nul + 5 > got) break;
+
+            const char* synWord = reinterpret_cast<const char*>(buf.data() + p);
+            int ci = AsciiStrCaseCmp(synWord, word.c_str());
+            if (ci == 0) {
+                uint32_t origIdx = ReadBE32(buf.data() + nul + 1);
+                if (!foundCI) {
+                    bestOrigIdx = origIdx;
+                    foundCI = true;
+                }
+                if (strcmp(synWord, word.c_str()) == 0) {
+                    return GetEntryByIndex(origIdx, outEntry);
+                }
+            } else if (ci > 0) {
+                passed = true;
+                break;
+            }
+            p = nul + 5;
+        }
+        if (passed) break;
+        if (!foundCI && b + 1 < static_cast<int>(synCheckpoints.size())) {
+            std::string nextFirst;
+            uint32_t dummyIdx = 0, dummyNext = 0;
+            if (!ReadSynEntryAt(synCheckpoints[b + 1].fileOffset, nextFirst, dummyIdx, dummyNext) ||
+                AsciiStrCaseCmp(nextFirst.c_str(), word.c_str()) > 0) {
+                break;
+            }
+        }
+    }
+
+    if (foundCI) {
+        return GetEntryByIndex(bestOrigIdx, outEntry);
+    }
+    return false;
+}
+
+bool StarDict::ReadDictZipRange(uint64_t offset, uint32_t size, std::string& out) {
+    if (dzChunkLen == 0 || dzChunkOffsets.size() < 2) return false;
+    if (size == 0) {
+        out.clear();
+        return true;
+    }
+
+    uint32_t numChunks = static_cast<uint32_t>(dzChunkOffsets.size() - 1);
+    uint32_t firstChunk = static_cast<uint32_t>(offset / dzChunkLen);
+    uint32_t lastChunk = static_cast<uint32_t>((offset + size - 1) / dzChunkLen);
+    if (firstChunk >= numChunks || lastChunk >= numChunks) return false;
+
+    out.clear();
+    out.reserve(size);
+
+    std::vector<unsigned char> compBuf;
+    std::vector<unsigned char> uncompBuf(dzChunkLen);
+
+    for (uint32_t c = firstChunk; c <= lastChunk; c++) {
+        uint32_t compStart = dzChunkOffsets[c];
+        uint32_t compLen = dzChunkOffsets[c + 1] - compStart;
+        if (compLen == 0) return false;
+
+        compBuf.resize(compLen);
+        if (fseek(dictFile, static_cast<long>(compStart), SEEK_SET) != 0) return false;
+        if (fread(compBuf.data(), 1, compLen, dictFile) != compLen) return false;
+
+        z_stream zs;
+        memset(&zs, 0, sizeof(zs));
+        if (inflateInit2(&zs, -MAX_WBITS) != Z_OK) return false;
+
+        zs.next_in = compBuf.data();
+        zs.avail_in = compLen;
+        zs.next_out = uncompBuf.data();
+        zs.avail_out = dzChunkLen;
+
+        int ret = inflate(&zs, Z_FINISH);
+        size_t produced = dzChunkLen - zs.avail_out;
+        inflateEnd(&zs);
+
+        if (ret != Z_OK && ret != Z_STREAM_END && ret != Z_BUF_ERROR) {
+            return false;
+        }
+        if (produced == 0) return false;
+
+        uint64_t chunkUncompStart = static_cast<uint64_t>(c) * dzChunkLen;
+        uint64_t sliceStart = (offset > chunkUncompStart) ? (offset - chunkUncompStart) : 0;
+        uint64_t wantEnd = offset + size;
+        uint64_t chunkUncompEnd = chunkUncompStart + produced;
+        uint64_t sliceEnd = (wantEnd < chunkUncompEnd) ? (wantEnd - chunkUncompStart) : produced;
+
+        if (sliceStart < sliceEnd && sliceEnd <= produced) {
+            out.append(reinterpret_cast<const char*>(uncompBuf.data() + sliceStart),
+                       static_cast<size_t>(sliceEnd - sliceStart));
+        }
+    }
+
+    return out.size() == size;
+}
+
+bool StarDict::ReadRawDefinition(const StarDictEntry& entry, std::string& outRaw) {
+    if (!dictFile) return false;
+    if (entry.dataSize == 0) {
+        outRaw.clear();
+        return true;
+    }
+    // Sanity cap to protect DS RAM (64 KB max single entry).
+    uint32_t cappedSize = (entry.dataSize > 65536) ? 65536 : entry.dataSize;
+
+    if (info.isDictZip) {
+        return ReadDictZipRange(entry.dataOffset, cappedSize, outRaw);
+    }
+
+    if (fseek(dictFile, static_cast<long>(entry.dataOffset), SEEK_SET) != 0) return false;
+    outRaw.resize(cappedSize);
+    size_t got = fread(&outRaw[0], 1, cappedSize, dictFile);
+    outRaw.resize(got);
+    return got > 0;
+}
+
+std::string StarDict::StripMarkup(const char* data, size_t len, char typeChar) {
+    std::string out;
+    out.reserve(len);
+
+    bool parseTags = (typeChar == 'g' || typeChar == 'h' || typeChar == 'x');
+    bool bold = false;
+    bool italic = false;
+    bool skipBlock = false; // skip <style> / <script> in HTML
+
+    size_t i = 0;
+    while (i < len) {
+        char c = data[i];
+        if (c == '\r') {
+            i++;
+            continue;
+        }
+
+        if (parseTags && c == '<') {
+            size_t close = i + 1;
+            while (close < len && data[close] != '>') close++;
+            if (close < len) {
+                std::string rawTag(data + i + 1, close - i - 1);
+                // Extract lowercase tag name (and whether closing)
+                bool isClosing = false;
+                size_t tStart = 0;
+                while (tStart < rawTag.size() && rawTag[tStart] == ' ') tStart++;
+                if (tStart < rawTag.size() && rawTag[tStart] == '/') {
+                    isClosing = true;
+                    tStart++;
+                }
+                size_t tEnd = tStart;
+                while (tEnd < rawTag.size() &&
+                       rawTag[tEnd] != ' ' && rawTag[tEnd] != '\t' &&
+                       rawTag[tEnd] != '/' && rawTag[tEnd] != '\n') {
+                    tEnd++;
+                }
+                std::string tag;
+                for (size_t k = tStart; k < tEnd; k++) {
+                    tag.push_back(static_cast<char>(AsciiToLower(static_cast<unsigned char>(rawTag[k]))));
+                }
+
+                if (tag == "style" || tag == "script") {
+                    skipBlock = !isClosing;
+                } else if (!skipBlock) {
+                    if (tag == "b" || tag == "strong" || tag == "k" || tag == "h1" || tag == "h2" || tag == "h3") {
+                        if (!isClosing && !bold) {
+                            out.push_back(static_cast<char>(DICT_STYLE_BOLD_ON));
+                            bold = true;
+                        } else if (isClosing && bold) {
+                            out.push_back(static_cast<char>(DICT_STYLE_BOLD_OFF));
+                            bold = false;
+                            if (tag == "k" || tag[0] == 'h') out.push_back('\n');
+                        }
+                    } else if (tag == "i" || tag == "em" || tag == "abr" || tag == "co" || tag == "ex") {
+                        if (!isClosing && !italic) {
+                            out.push_back(static_cast<char>(DICT_STYLE_ITALIC_ON));
+                            italic = true;
+                        } else if (isClosing && italic) {
+                            out.push_back(static_cast<char>(DICT_STYLE_ITALIC_OFF));
+                            italic = false;
+                            if (tag == "ex") out.push_back('\n');
+                        }
+                    } else if (tag == "br" || (isClosing && (tag == "p" || tag == "div" || tag == "def" || tag == "blockquote" || (typeChar != 'x' && tag == "tr")))) {
+                        out.push_back('\n');
+                    } else if (tag == "li" && !isClosing) {
+                        out.push_back('\n');
+                        out.append("- ");
+                    } else if (typeChar == 'x' && tag == "tr" && !isClosing) {
+                        // XDXF pronunciation <tr ...>
+                        out.append(" [");
+                    } else if (typeChar == 'x' && tag == "tr" && isClosing) {
+                        out.append("] ");
+                    }
+                }
+                i = close + 1;
+                continue;
+            }
+        }
+
+        if (skipBlock) {
+            i++;
+            continue;
+        }
+
+        if (parseTags && c == '&') {
+            size_t semi = i + 1;
+            while (semi < len && semi - i < 12 && data[semi] != ';' && data[semi] != ' ' && data[semi] != '<') {
+                semi++;
+            }
+            if (semi < len && data[semi] == ';') {
+                std::string ent(data + i + 1, semi - i - 1);
+                if (ent == "amp") out.push_back('&');
+                else if (ent == "lt") out.push_back('<');
+                else if (ent == "gt") out.push_back('>');
+                else if (ent == "quot") out.push_back('"');
+                else if (ent == "apos") out.push_back('\'');
+                else if (ent == "nbsp") out.push_back(' ');
+                else if (ent == "mdash") AppendUtf8(out, 0x2014);
+                else if (ent == "ndash") AppendUtf8(out, 0x2013);
+                else if (ent.size() >= 2 && ent[0] == '#') {
+                    uint32_t cp = 0;
+                    if (ent[1] == 'x' || ent[1] == 'X') {
+                        cp = static_cast<uint32_t>(strtoul(ent.c_str() + 2, nullptr, 16));
+                    } else {
+                        cp = static_cast<uint32_t>(strtoul(ent.c_str() + 1, nullptr, 10));
+                    }
+                    AppendUtf8(out, cp);
+                }
+                i = semi + 1;
+                continue;
+            }
+        }
+
+        // Ignore control bytes that could collide with dslibris style codes.
+        if (static_cast<unsigned char>(c) < 0x20 && c != '\n' && c != '\t') {
+            i++;
+            continue;
+        }
+        if (c == '\t') {
+            out.push_back(' ');
+            i++;
+            continue;
+        }
+
+        out.push_back(c);
+        i++;
+    }
+
+    if (bold) out.push_back(static_cast<char>(DICT_STYLE_BOLD_OFF));
+    if (italic) out.push_back(static_cast<char>(DICT_STYLE_ITALIC_OFF));
+
+    // Collapse >2 consecutive newlines and trim leading/trailing newlines/spaces.
+    std::string clean;
+    clean.reserve(out.size());
+    int nlCount = 0;
+    for (size_t k = 0; k < out.size(); k++) {
+        char ch = out[k];
+        if (ch == '\n') {
+            nlCount++;
+            if (nlCount <= 2) clean.push_back('\n');
+        } else {
+            nlCount = 0;
+            clean.push_back(ch);
+        }
+    }
+
+    size_t s = 0;
+    while (s < clean.size() && (clean[s] == '\n' || clean[s] == ' ')) s++;
+    size_t e = clean.size();
+    while (e > s && (clean[e - 1] == '\n' || clean[e - 1] == ' ')) e--;
+    return clean.substr(s, e - s);
+}
+
+std::string StarDict::FormatDefinition(const std::string& raw) const {
+    if (raw.empty()) return std::string();
+
+    std::string combined;
+    auto appendSection = [&](char typeChar, const char* data, size_t len) {
+        if (len == 0) return;
+        // Skip binary/non-text payloads (uppercase type chars: W=wav, P=pic, X=xf, r=resource)
+        if (typeChar >= 'A' && typeChar <= 'Z') return;
+        if (typeChar == 'r') return;
+
+        std::string part;
+        if (typeChar == 't' || typeChar == 'y') {
+            // Phonetic / pinyin transcription
+            std::string pron = StripMarkup(data, len, 'm');
+            if (!pron.empty()) {
+                part.push_back(static_cast<char>(DICT_STYLE_ITALIC_ON));
+                part.push_back('/');
+                part.append(pron);
+                part.push_back('/');
+                part.push_back(static_cast<char>(DICT_STYLE_ITALIC_OFF));
+            }
+        } else {
+            part = StripMarkup(data, len, typeChar);
+        }
+
+        if (!part.empty()) {
+            if (!combined.empty()) combined.push_back('\n');
+            combined.append(part);
+        }
+    };
+
+    const std::string& seq = info.sameTypeSequence;
+    if (!seq.empty()) {
+        size_t pos = 0;
+        for (size_t si = 0; si < seq.size() && pos < raw.size(); si++) {
+            char t = seq[si];
+            bool isLast = (si + 1 == seq.size());
+            if (t >= 'A' && t <= 'Z') {
+                if (isLast) {
+                    pos = raw.size();
+                } else {
+                    if (pos + 4 > raw.size()) break;
+                    uint32_t sz = ReadBE32(reinterpret_cast<const unsigned char*>(raw.data() + pos));
+                    pos += 4 + sz;
+                }
+            } else {
+                if (isLast) {
+                    appendSection(t, raw.data() + pos, raw.size() - pos);
+                    pos = raw.size();
+                } else {
+                    size_t nul = raw.find('\0', pos);
+                    if (nul == std::string::npos) {
+                        appendSection(t, raw.data() + pos, raw.size() - pos);
+                        pos = raw.size();
+                    } else {
+                        appendSection(t, raw.data() + pos, nul - pos);
+                        pos = nul + 1;
+                    }
+                }
+            }
+        }
+    } else {
+        size_t pos = 0;
+        while (pos < raw.size()) {
+            char t = raw[pos++];
+            if (t >= 'A' && t <= 'Z') {
+                if (pos + 4 > raw.size()) break;
+                uint32_t sz = ReadBE32(reinterpret_cast<const unsigned char*>(raw.data() + pos));
+                pos += 4;
+                if (pos + sz > raw.size()) break;
+                pos += sz;
+            } else {
+                size_t nul = raw.find('\0', pos);
+                if (nul == std::string::npos) {
+                    appendSection(t, raw.data() + pos, raw.size() - pos);
+                    break;
+                } else {
+                    appendSection(t, raw.data() + pos, nul - pos);
+                    pos = nul + 1;
+                }
+            }
+        }
+    }
+
+    return combined;
+}
+
+bool StarDict::ReadDefinition(const StarDictEntry& entry, std::string& outFormatted) {
+    std::string raw;
+    if (!ReadRawDefinition(entry, raw)) return false;
+    outFormatted = FormatDefinition(raw);
+    return true;
+}
