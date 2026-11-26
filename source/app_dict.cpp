@@ -837,3 +837,223 @@ void DictUI::DrawStyledText(App* app, u16* fb, u16 x, u16 y, const std::string& 
     outItalic = italic;
 }
 
+void DictUI::DrawDefinitionView(App* app) {
+    Text* ts = app->ts;
+    u16* prevScreen = ts->GetScreen();
+    int prevStyle = ts->GetStyle();
+    bool inv = ts->GetInvert();
+
+    u16* dstFb = (defScreenIdx == 0) ? ts->screenleft : ts->screenright;
+    u16* fb = ts->offscreen;
+    ts->SetScreen(fb);
+    ts->ClearScreen();
+
+    u16 borderCol = inv ? MakeColor(10, 10, 12) : MakeColor(20, 20, 22);
+    u16 barBg = inv ? MakeColor(4, 4, 6) : MakeColor(28, 28, 30);
+
+    // --- Header bar ---
+    FillRect(fb, 0, 0, ts->display.width, kHeaderHeight, barBg);
+    DrawHLine(fb, 0, ts->display.width, kHeaderHeight, borderCol);
+
+    std::string headerText;
+    if (currentResult.found) {
+        headerText.push_back(static_cast<char>(TEXT_BOLD_ON));
+        headerText += currentResult.headword;
+        headerText.push_back(static_cast<char>(TEXT_BOLD_OFF));
+        if (!currentResult.queried.empty() && currentResult.queried != currentResult.headword) {
+            headerText += " ";
+            headerText.push_back(static_cast<char>(TEXT_ITALIC_ON));
+            headerText += "(" + currentResult.queried + ")";
+            headerText.push_back(static_cast<char>(TEXT_ITALIC_OFF));
+        }
+    } else {
+        headerText.push_back(static_cast<char>(TEXT_BOLD_ON));
+        headerText += currentResult.queried.empty() ? "Dictionary" : currentResult.queried;
+        headerText.push_back(static_cast<char>(TEXT_BOLD_OFF));
+    }
+
+    bool dummyB = false, dummyI = false;
+    DrawStyledText(app, fb, kDefMarginLeft, 18, headerText, ts->display.width - 8, false, false, dummyB, dummyI);
+
+    // --- Scrollable body ---
+    ts->SetStyle(TEXT_STYLE_REGULAR);
+    int lineH = ts->GetHeight();
+    if (lineH < 8) lineH = 12;
+
+    int maxScroll = std::max(0, static_cast<int>(wrappedLines.size()) - viewportLines);
+    if (scrollLine > maxScroll) scrollLine = maxScroll;
+    if (scrollLine < 0) scrollLine = 0;
+
+    int y = kHeaderHeight + lineH + 2;
+    int endLine = std::min<int>(static_cast<int>(wrappedLines.size()), scrollLine + viewportLines);
+    for (int ln = scrollLine; ln < endLine; ln++) {
+        bool b = false, it = false;
+        DrawStyledText(app, fb, kDefMarginLeft, static_cast<u16>(y), wrappedLines[ln],
+                       ts->display.width - kDefMarginRight, false, false, b, it);
+        y += lineH;
+    }
+
+    // --- Scrollbar (right edge) ---
+    if (static_cast<int>(wrappedLines.size()) > viewportLines) {
+        int trackTop = kHeaderHeight + 4;
+        int trackBottom = ts->display.height - kFooterHeight - 4;
+        int trackH = trackBottom - trackTop;
+        int thumbH = std::max(10, (trackH * viewportLines) / static_cast<int>(wrappedLines.size()));
+        int thumbY = trackTop + ((trackH - thumbH) * scrollLine) / std::max(1, maxScroll);
+        FillRect(fb, ts->display.width - 4, trackTop, ts->display.width - 2, trackBottom, barBg);
+        FillRect(fb, ts->display.width - 4, thumbY, ts->display.width - 2, thumbY + thumbH, borderCol);
+    }
+
+    // --- Footer bar ---
+    int footerY = ts->display.height - kFooterHeight;
+    FillRect(fb, 0, footerY, ts->display.width, ts->display.height, barBg);
+    DrawHLine(fb, 0, ts->display.width, footerY, borderCol);
+
+    std::string footer;
+    if (!currentResult.nearby.empty()) {
+        footer = "B:close  Up/Dn:scroll  L/R:near";
+    } else {
+        footer = "B:close  Up/Dn:scroll";
+    }
+    ts->SetStyle(TEXT_STYLE_BROWSER);
+    DrawStyledText(app, fb, 6, static_cast<u16>(footerY + 15), footer, ts->display.width - 6, false, false, dummyB, dummyI);
+
+    ts->CopyScreen(fb, dstFb);
+
+    ts->SetStyle(prevStyle);
+    ts->SetScreen(prevScreen);
+    defDirty = false;
+}
+
+void DictUI::HandleViewEvent(App* app) {
+    u32 down = keysDown();
+    u32 held = keysHeld();
+    u32 up = keysUp();
+
+    if (down & KEY_B) {
+        CloseDefinition(app);
+        return;
+    }
+
+    int maxScroll = std::max(0, static_cast<int>(wrappedLines.size()) - viewportLines);
+
+    // Note: app->key.* are in pre-rotation hardware space (DS held vertically like a book):
+    //   Visual DOWN  = app->key.left   (scroll down)
+    //   Visual UP    = app->key.right  (scroll up)
+    //   Visual RIGHT = app->key.down   (next nearby)
+    //   Visual LEFT  = app->key.up     (prev nearby)
+    bool wantDown = (held & (app->key.left | KEY_A)) != 0;
+    bool wantUp = (held & app->key.right) != 0;
+    int curDir = wantDown ? 1 : (wantUp ? -1 : 0);
+
+    if (down & (app->key.left | KEY_A)) {
+        scrollHoldDir = 1;
+        scrollHoldFrames = 0;
+        if (scrollLine < maxScroll) {
+            scrollLine = std::min(maxScroll, scrollLine + 2);
+            defDirty = true;
+        }
+    } else if (down & app->key.right) {
+        scrollHoldDir = -1;
+        scrollHoldFrames = 0;
+        if (scrollLine > 0) {
+            scrollLine = std::max(0, scrollLine - 2);
+            defDirty = true;
+        }
+    } else if (curDir != 0 && curDir == scrollHoldDir) {
+        scrollHoldFrames++;
+        if (scrollHoldFrames >= kScrollDelayFrames &&
+            ((scrollHoldFrames - kScrollDelayFrames) % kScrollIntervalFrames) == 0) {
+            if (curDir > 0 && scrollLine < maxScroll) {
+                scrollLine++;
+                defDirty = true;
+            } else if (curDir < 0 && scrollLine > 0) {
+                scrollLine--;
+                defDirty = true;
+            }
+        }
+    } else {
+        scrollHoldDir = curDir;
+        scrollHoldFrames = 0;
+    }
+
+    if ((down & (app->key.r | app->key.down)) && !currentResult.nearby.empty()) {
+        // Jump to next nearby headword
+        nearbyCursor = (nearbyCursor + 1) % static_cast<int>(currentResult.nearby.size());
+        std::vector<std::string> savedNearby = currentResult.nearby;
+        LookupResult nextRes;
+        app->dictManager.LookupExactHeadword(savedNearby[nearbyCursor], nextRes);
+        nextRes.nearby = savedNearby;
+        currentResult = nextRes;
+        scrollLine = 0;
+        WrapDefinitionLines(app);
+        defDirty = true;
+    } else if ((down & (app->key.l | app->key.up)) && !currentResult.nearby.empty()) {
+        // Jump to previous nearby headword
+        int cnt = static_cast<int>(currentResult.nearby.size());
+        nearbyCursor = (nearbyCursor <= 0) ? (cnt - 1) : (nearbyCursor - 1);
+        std::vector<std::string> savedNearby = currentResult.nearby;
+        LookupResult prevRes;
+        app->dictManager.LookupExactHeadword(savedNearby[nearbyCursor], prevRes);
+        prevRes.nearby = savedNearby;
+        currentResult = prevRes;
+        scrollLine = 0;
+        WrapDefinitionLines(app);
+        defDirty = true;
+    }
+
+    // Touch handling inside definition view
+    u8 touchIdx = GetTouchScreenIdx(app);
+    if (down & KEY_TOUCH) {
+        touchPosition coord = app->TouchRead();
+        viewTouchDown = true;
+        viewTouchStartX = coord.py;
+        viewTouchStartY = coord.px;
+        viewTouchStartScroll = scrollLine;
+        viewTouchDragged = false;
+    } else if (viewTouchDown && (held & KEY_TOUCH)) {
+        if (defScreenIdx == touchIdx) {
+            touchPosition coord = app->TouchRead();
+            int dy = static_cast<int>(viewTouchStartY) - static_cast<int>(coord.px);
+            if (dy > 6 || dy < -6) {
+                viewTouchDragged = true;
+                int lineH = std::max<int>(8, app->ts->GetHeight());
+                int newScroll = viewTouchStartScroll + (dy / lineH);
+                newScroll = std::max(0, std::min(maxScroll, newScroll));
+                if (newScroll != scrollLine) {
+                    scrollLine = newScroll;
+                    defDirty = true;
+                }
+            }
+        }
+    } else if (viewTouchDown && (up & KEY_TOUCH)) {
+        viewTouchDown = false;
+        if (!viewTouchDragged) {
+            if (defScreenIdx != touchIdx) {
+                // Tapping the reading screen dismisses the opposite-screen definition.
+                CloseDefinition(app);
+                return;
+            } else {
+                // On the definition touch screen: tap footer closes, tap upper/lower halves scroll.
+                if (viewTouchStartY >= static_cast<u16>(app->ts->display.height - kFooterHeight)) {
+                    CloseDefinition(app);
+                    return;
+                } else if (viewTouchStartY < static_cast<u16>(app->ts->display.height / 2)) {
+                    if (scrollLine > 0) {
+                        scrollLine = std::max(0, scrollLine - viewportLines + 1);
+                        defDirty = true;
+                    }
+                } else {
+                    if (scrollLine < maxScroll) {
+                        scrollLine = std::min(maxScroll, scrollLine + viewportLines - 1);
+                        defDirty = true;
+                    }
+                }
+            }
+        }
+    }
+
+    if (defDirty) {
+        DrawDefinitionView(app);
+    }
+}
