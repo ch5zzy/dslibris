@@ -276,3 +276,181 @@ std::string Utf8PrefixChars(const std::string& s, size_t maxChars) {
 // LemmaTable ("DLM1")
 // ---------------------------------------------------------------------------
 
+LemmaTable::LemmaTable() : fp(nullptr), dataStart(0), fileSize(0), indexed(false) {}
+
+LemmaTable::~LemmaTable() {
+    Close();
+}
+
+bool LemmaTable::Open(const std::string& path) {
+    Close();
+    fp = fopen(path.c_str(), "rb");
+    if (!fp) return false;
+
+    unsigned char hdr[12];
+    if (fread(hdr, 1, 12, fp) != 12) {
+        Close();
+        return false;
+    }
+    if (memcmp(hdr, "DLM1", 4) != 0) {
+        Close();
+        return false;
+    }
+    (void)ReadLE32(hdr + 8);
+
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0 || st.st_size <= 12) {
+        Close();
+        return false;
+    }
+    dataStart = 12;
+    fileSize = static_cast<uint32_t>(st.st_size);
+    return true;
+}
+
+void LemmaTable::Close() {
+    if (fp) {
+        fclose(fp);
+        fp = nullptr;
+    }
+    checkpoints.clear();
+    dataStart = 0;
+    fileSize = 0;
+    indexed = false;
+}
+
+bool LemmaTable::EnsureIndexed() {
+    if (indexed) return !checkpoints.empty();
+    if (!fp || fileSize <= dataStart) return false;
+
+    checkpoints.clear();
+    uint32_t dataLen = fileSize - dataStart;
+    uint32_t blockBytes = dataLen / kLemMaxCheckpoints;
+    if (blockBytes < kLemMinBlockBytes) blockBytes = kLemMinBlockBytes;
+
+    if (fseek(fp, static_cast<long>(dataStart), SEEK_SET) != 0) return false;
+
+    std::vector<unsigned char> buf(kLemScanBufSize);
+    uint32_t pos = dataStart;
+    uint32_t nextChk = dataStart;
+    int nullsSeenInRecord = 0;
+    bool atRecordStart = true;
+
+    while (true) {
+        size_t n = fread(buf.data(), 1, buf.size(), fp);
+        if (n == 0) break;
+        for (size_t i = 0; i < n; i++, pos++) {
+            if (atRecordStart) {
+                if (pos >= nextChk) {
+                    checkpoints.push_back({pos});
+                    nextChk = pos + blockBytes;
+                }
+                atRecordStart = false;
+            }
+            if (buf[i] == 0) {
+                nullsSeenInRecord++;
+                if (nullsSeenInRecord == 2) {
+                    nullsSeenInRecord = 0;
+                    atRecordStart = true;
+                }
+            }
+        }
+    }
+
+    indexed = true;
+    return !checkpoints.empty();
+}
+
+bool LemmaTable::ReadFirstWordAt(uint32_t offset, std::string& outWord) {
+    if (fseek(fp, static_cast<long>(offset), SEEK_SET) != 0) return false;
+    char tmp[260];
+    size_t n = fread(tmp, 1, sizeof(tmp) - 1, fp);
+    if (n == 0) return false;
+    tmp[n] = '\0';
+    outWord.assign(tmp);
+    return true;
+}
+
+bool LemmaTable::FindLemmas(const std::string& word, std::vector<std::string>& outLemmas) {
+    if (!fp || word.empty()) return false;
+    if (!EnsureIndexed()) return false;
+
+    int lo = 0;
+    int hi = static_cast<int>(checkpoints.size()) - 1;
+    int block = 0;
+
+    while (lo <= hi) {
+        int mid = lo + (hi - lo) / 2;
+        std::string w;
+        if (!ReadFirstWordAt(checkpoints[mid].fileOffset, w)) return false;
+        int cmp = AsciiCaseCmp(w.c_str(), word.c_str());
+        if (cmp <= 0) {
+            block = mid;
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+
+    while (block > 0) {
+        std::string w;
+        if (!ReadFirstWordAt(checkpoints[block].fileOffset, w)) break;
+        if (AsciiCaseCmp(w.c_str(), word.c_str()) == 0) {
+            block--;
+        } else {
+            break;
+        }
+    }
+
+    bool found = false;
+    for (int b = block; b < static_cast<int>(checkpoints.size()); b++) {
+        uint32_t startOff = checkpoints[b].fileOffset;
+        uint32_t endOff = (b + 1 < static_cast<int>(checkpoints.size()))
+                              ? checkpoints[b + 1].fileOffset
+                              : fileSize;
+        if (endOff <= startOff) break;
+
+        size_t span = endOff - startOff;
+        std::vector<unsigned char> buf(span);
+        if (fseek(fp, static_cast<long>(startOff), SEEK_SET) != 0) return false;
+        size_t got = fread(buf.data(), 1, span, fp);
+
+        size_t p = 0;
+        bool passed = false;
+        while (p < got) {
+            size_t nul1 = p;
+            while (nul1 < got && buf[nul1] != 0) nul1++;
+            if (nul1 >= got) break;
+            size_t nul2 = nul1 + 1;
+            while (nul2 < got && buf[nul2] != 0) nul2++;
+            if (nul2 >= got) break;
+
+            const char* key = reinterpret_cast<const char*>(buf.data() + p);
+            const char* lemma = reinterpret_cast<const char*>(buf.data() + nul1 + 1);
+            int cmp = AsciiCaseCmp(key, word.c_str());
+            if (cmp == 0) {
+                AddUnique(outLemmas, std::string(lemma, nul2 - (nul1 + 1)));
+                found = true;
+            } else if (cmp > 0) {
+                passed = true;
+                break;
+            }
+            p = nul2 + 1;
+        }
+        if (passed) break;
+        if (!found && b + 1 < static_cast<int>(checkpoints.size())) {
+            std::string nextFirst;
+            if (!ReadFirstWordAt(checkpoints[b + 1].fileOffset, nextFirst) ||
+                AsciiCaseCmp(nextFirst.c_str(), word.c_str()) > 0) {
+                break;
+            }
+        }
+    }
+
+    return found;
+}
+
+// ---------------------------------------------------------------------------
+// DictionaryManager (single active dictionary, selected in Settings)
+// ---------------------------------------------------------------------------
+
