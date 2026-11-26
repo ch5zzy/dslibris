@@ -4,13 +4,13 @@
 version=$(cat include/version.h | cut -c 17- | tr -d '"')
 zipfile=dslibris-${version}.zip
 
-rm *.zip
+rm -f *.zip
 make clean
 make -j 2
 if [ $? != 0 ]
 then
 	echo "BUILD FAILED"
-	return 1
+	exit 1
 fi
 
 # This might apply for the most users,
@@ -18,4 +18,4 @@ fi
 dlditool etc/dldi/r4tf_v2.dldi dslibris.nds
 
 zip ${zipfile} dslibris.nds
-(cd etc/filesystem/en; zip -r -u ../../../${zipfile} .)
+(cd etc/filesystem/en; zip -r -u ../../../${zipfile} . -x '*.DS_Store')
