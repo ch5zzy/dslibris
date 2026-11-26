@@ -572,3 +572,268 @@ void DictUI::HandleSelectEvent(App* app) {
     }
 }
 
+void DictUI::OpenDefinitionForSelected(App* app) {
+    if (!app->bookcurrent || selectedWordIdx < 0 ||
+        selectedWordIdx >= static_cast<int>(app->pageWords.size())) {
+        CancelSelection(app);
+        return;
+    }
+
+    const WordBox& wb = app->pageWords[selectedWordIdx];
+    Page* page = app->bookcurrent->GetPage();
+    if (!page) {
+        CancelSelection(app);
+        return;
+    }
+
+    std::string rawWord = page->ExtractWord(wb);
+    u8 targetDefScreen = 1 - wb.screenIdx; // Opposite screen keeps sentence visible!
+
+    DrawSelectHint(app, "looking up...");
+    LookupResult res;
+    app->dictManager.Lookup(rawWord, res, wb.isCjk);
+
+    ShowLookupResult(app, res, targetDefScreen);
+}
+
+void DictUI::ShowLookupResult(App* app, const LookupResult& res, u8 targetDefScreen) {
+    currentResult = res;
+    defScreenIdx = targetDefScreen;
+    nearbyCursor = -1;
+    scrollLine = 0;
+    scrollHoldDir = 0;
+    scrollHoldFrames = 0;
+    viewTouchDown = false;
+    viewTouchDragged = false;
+
+    WrapDefinitionLines(app);
+    if (defScreenIdx != 0) {
+        DrawSelectHint(app, "");
+    }
+    app->mode = APP_MODE_DICT_VIEW;
+    defDirty = true;
+    DrawDefinitionView(app);
+}
+
+void DictUI::CloseDefinition(App* app) {
+    ClearHighlight(app);
+    selectedWordIdx = -1;
+    app->mode = APP_MODE_BOOK;
+    if (app->bookcurrent && app->bookcurrent->GetPage()) {
+        app->bookcurrent->GetPage()->Draw(app->ts);
+    }
+}
+
+void DictUI::WrapDefinitionLines(App* app) {
+    wrappedLines.clear();
+    Text* ts = app->ts;
+    int maxW = ts->display.width - kDefMarginLeft - kDefMarginRight;
+
+    // Save font style state
+    int savedStyle = ts->GetStyle();
+    ts->SetStyle(TEXT_STYLE_REGULAR);
+
+    std::string source;
+    if (currentResult.found && !currentResult.definition.empty()) {
+        source = currentResult.definition;
+    } else if (!currentResult.found) {
+        source = "No exact entry found.";
+        if (!currentResult.nearby.empty()) {
+            source += "\n\nNearby headwords (L/R to browse):";
+            for (size_t i = 0; i < currentResult.nearby.size(); i++) {
+                source += "\n- ";
+                source += currentResult.nearby[i];
+            }
+        }
+    } else {
+        source = "(empty definition)";
+    }
+
+    bool bold = false;
+    bool italic = false;
+
+    auto currentFaceStyle = [&]() -> u8 {
+        if (bold && italic) return TEXT_STYLE_BOLDITALIC;
+        if (bold) return TEXT_STYLE_BOLD;
+        if (italic) return TEXT_STYLE_ITALIC;
+        return TEXT_STYLE_REGULAR;
+    };
+
+    auto prefixStyleBytes = [&]() -> std::string {
+        std::string p;
+        if (bold) p.push_back(static_cast<char>(TEXT_BOLD_ON));
+        if (italic) p.push_back(static_cast<char>(TEXT_ITALIC_ON));
+        return p;
+    };
+
+    std::string curLine = prefixStyleBytes();
+    int curW = 0;
+    size_t i = 0;
+
+    while (i < source.size()) {
+        unsigned char c = static_cast<unsigned char>(source[i]);
+        if (c == '\n') {
+            wrappedLines.push_back(curLine);
+            curLine = prefixStyleBytes();
+            curW = 0;
+            i++;
+            continue;
+        }
+        if (c == TEXT_BOLD_ON) {
+            bold = true;
+            curLine.push_back(static_cast<char>(c));
+            i++;
+            continue;
+        }
+        if (c == TEXT_BOLD_OFF) {
+            bold = false;
+            curLine.push_back(static_cast<char>(c));
+            i++;
+            continue;
+        }
+        if (c == TEXT_ITALIC_ON) {
+            italic = true;
+            curLine.push_back(static_cast<char>(c));
+            i++;
+            continue;
+        }
+        if (c == TEXT_ITALIC_OFF) {
+            italic = false;
+            curLine.push_back(static_cast<char>(c));
+            i++;
+            continue;
+        }
+
+        if (c == ' ') {
+            u8 adv = ts->GetAdvance(' ', currentFaceStyle());
+            if (curW > 0 && curW + adv <= maxW) {
+                curLine.push_back(' ');
+                curW += adv;
+            }
+            i++;
+            continue;
+        }
+
+        // Measure next word (up to whitespace, newline, or CJK break)
+        size_t wordStart = i;
+        int wordW = 0;
+        bool simBold = bold;
+        bool simItalic = italic;
+        size_t j = i;
+        while (j < source.size()) {
+            unsigned char ch = static_cast<unsigned char>(source[j]);
+            if (ch == ' ' || ch == '\n') break;
+            if (ch == TEXT_BOLD_ON) { simBold = true; j++; continue; }
+            if (ch == TEXT_BOLD_OFF) { simBold = false; j++; continue; }
+            if (ch == TEXT_ITALIC_ON) { simItalic = true; j++; continue; }
+            if (ch == TEXT_ITALIC_OFF) { simItalic = false; j++; continue; }
+
+            uint32_t cp = 0;
+            size_t step = DictText::Utf8Decode(source.data() + j, source.size() - j, &cp);
+            if (step == 0) step = 1;
+            u8 st = (simBold && simItalic) ? TEXT_STYLE_BOLDITALIC
+                  : (simBold ? TEXT_STYLE_BOLD : (simItalic ? TEXT_STYLE_ITALIC : TEXT_STYLE_REGULAR));
+            int adv = MeasureCodepoint(ts, cp, st);
+
+            // Allow wrapping between CJK chars if word exceeds width
+            if (DictText::IsCjkCodepoint(cp) && j > wordStart) break;
+            if (wordW + adv > maxW && j > wordStart) break;
+
+            wordW += adv;
+            j += step;
+            if (DictText::IsCjkCodepoint(cp)) break;
+        }
+
+        if (curW > 0 && curW + wordW > maxW) {
+            wrappedLines.push_back(curLine);
+            curLine = prefixStyleBytes();
+            curW = 0;
+        }
+
+        // Append word bytes and update bold/italic state
+        for (size_t k = wordStart; k < j; k++) {
+            unsigned char ch = static_cast<unsigned char>(source[k]);
+            if (ch == TEXT_BOLD_ON) bold = true;
+            else if (ch == TEXT_BOLD_OFF) bold = false;
+            else if (ch == TEXT_ITALIC_ON) italic = true;
+            else if (ch == TEXT_ITALIC_OFF) italic = false;
+            curLine.push_back(source[k]);
+        }
+        curW += wordW;
+        i = j;
+    }
+
+    if (!curLine.empty()) {
+        wrappedLines.push_back(curLine);
+    }
+
+    int lineH = ts->GetHeight();
+    if (lineH < 8) lineH = 12;
+    int bodyH = ts->display.height - kHeaderHeight - kFooterHeight - 6;
+    viewportLines = std::max(1, bodyH / lineH);
+
+    ts->SetStyle(savedStyle);
+}
+
+void DictUI::DrawHLine(u16* fb, u16 x0, u16 x1, u16 y, u16 color) {
+    int stride = 256;
+    for (u16 x = x0; x < x1; x++) {
+        fb[y * stride + x] = color;
+    }
+}
+
+void DictUI::FillRect(u16* fb, u16 x0, u16 y0, u16 x1, u16 y1, u16 color) {
+    int stride = 256;
+    for (u16 y = y0; y < y1; y++) {
+        for (u16 x = x0; x < x1; x++) {
+            fb[y * stride + x] = color;
+        }
+    }
+}
+
+void DictUI::DrawStyledText(App* app, u16* fb, u16 x, u16 y, const std::string& text,
+                            int maxX, bool initialBold, bool initialItalic,
+                            bool& outBold, bool& outItalic) {
+    Text* ts = app->ts;
+    ts->SetScreen(fb);
+    ts->SetPen(x, y);
+
+    bool bold = initialBold;
+    bool italic = initialItalic;
+
+    size_t i = 0;
+    while (i < text.size()) {
+        unsigned char c = static_cast<unsigned char>(text[i]);
+        if (c == TEXT_BOLD_ON) { bold = true; i++; continue; }
+        if (c == TEXT_BOLD_OFF) { bold = false; i++; continue; }
+        if (c == TEXT_ITALIC_ON) { italic = true; i++; continue; }
+        if (c == TEXT_ITALIC_OFF) { italic = false; i++; continue; }
+
+        uint32_t cp = 0;
+        size_t step = DictText::Utf8Decode(text.data() + i, text.size() - i, &cp);
+        if (step == 0) step = 1;
+        i += step;
+
+        u8 st = (bold && italic) ? TEXT_STYLE_BOLDITALIC
+              : (bold ? TEXT_STYLE_BOLD : (italic ? TEXT_STYLE_ITALIC : TEXT_STYLE_REGULAR));
+        if (cp >= 0x80 && !HasGlyph(ts, cp, st)) {
+            const char* fb = MissingGlyphFallback(cp);
+            if (fb) {
+                for (const char* p = fb; *p; p++) {
+                    u32 fcp = static_cast<u32>(static_cast<unsigned char>(*p));
+                    u8 adv = ts->GetAdvance(fcp, st);
+                    if (ts->GetPenX() + adv > maxX) break;
+                    ts->PrintChar(fcp, st);
+                }
+                continue;
+            }
+        }
+        u8 adv = ts->GetAdvance(cp, st);
+        if (ts->GetPenX() + adv > maxX) break;
+        ts->PrintChar(cp, st);
+    }
+
+    outBold = bold;
+    outItalic = italic;
+}
+
