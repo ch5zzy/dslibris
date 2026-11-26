@@ -889,3 +889,249 @@ bool StarDict::ReadRawDefinition(const StarDictEntry& entry, std::string& outRaw
     return got > 0;
 }
 
+std::string StarDict::StripMarkup(const char* data, size_t len, char typeChar) {
+    std::string out;
+    out.reserve(len);
+
+    bool parseTags = (typeChar == 'g' || typeChar == 'h' || typeChar == 'x');
+    bool bold = false;
+    bool italic = false;
+    bool skipBlock = false; // skip <style> / <script> in HTML
+
+    size_t i = 0;
+    while (i < len) {
+        char c = data[i];
+        if (c == '\r') {
+            i++;
+            continue;
+        }
+
+        if (parseTags && c == '<') {
+            size_t close = i + 1;
+            while (close < len && data[close] != '>') close++;
+            if (close < len) {
+                std::string rawTag(data + i + 1, close - i - 1);
+                // Extract lowercase tag name (and whether closing)
+                bool isClosing = false;
+                size_t tStart = 0;
+                while (tStart < rawTag.size() && rawTag[tStart] == ' ') tStart++;
+                if (tStart < rawTag.size() && rawTag[tStart] == '/') {
+                    isClosing = true;
+                    tStart++;
+                }
+                size_t tEnd = tStart;
+                while (tEnd < rawTag.size() &&
+                       rawTag[tEnd] != ' ' && rawTag[tEnd] != '\t' &&
+                       rawTag[tEnd] != '/' && rawTag[tEnd] != '\n') {
+                    tEnd++;
+                }
+                std::string tag;
+                for (size_t k = tStart; k < tEnd; k++) {
+                    tag.push_back(static_cast<char>(AsciiToLower(static_cast<unsigned char>(rawTag[k]))));
+                }
+
+                if (tag == "style" || tag == "script") {
+                    skipBlock = !isClosing;
+                } else if (!skipBlock) {
+                    if (tag == "b" || tag == "strong" || tag == "k" || tag == "h1" || tag == "h2" || tag == "h3") {
+                        if (!isClosing && !bold) {
+                            out.push_back(static_cast<char>(DICT_STYLE_BOLD_ON));
+                            bold = true;
+                        } else if (isClosing && bold) {
+                            out.push_back(static_cast<char>(DICT_STYLE_BOLD_OFF));
+                            bold = false;
+                            if (tag == "k" || tag[0] == 'h') out.push_back('\n');
+                        }
+                    } else if (tag == "i" || tag == "em" || tag == "abr" || tag == "co" || tag == "ex") {
+                        if (!isClosing && !italic) {
+                            out.push_back(static_cast<char>(DICT_STYLE_ITALIC_ON));
+                            italic = true;
+                        } else if (isClosing && italic) {
+                            out.push_back(static_cast<char>(DICT_STYLE_ITALIC_OFF));
+                            italic = false;
+                            if (tag == "ex") out.push_back('\n');
+                        }
+                    } else if (tag == "br" || (isClosing && (tag == "p" || tag == "div" || tag == "def" || tag == "blockquote" || (typeChar != 'x' && tag == "tr")))) {
+                        out.push_back('\n');
+                    } else if (tag == "li" && !isClosing) {
+                        out.push_back('\n');
+                        out.append("- ");
+                    } else if (typeChar == 'x' && tag == "tr" && !isClosing) {
+                        // XDXF pronunciation <tr ...>
+                        out.append(" [");
+                    } else if (typeChar == 'x' && tag == "tr" && isClosing) {
+                        out.append("] ");
+                    }
+                }
+                i = close + 1;
+                continue;
+            }
+        }
+
+        if (skipBlock) {
+            i++;
+            continue;
+        }
+
+        if (parseTags && c == '&') {
+            size_t semi = i + 1;
+            while (semi < len && semi - i < 12 && data[semi] != ';' && data[semi] != ' ' && data[semi] != '<') {
+                semi++;
+            }
+            if (semi < len && data[semi] == ';') {
+                std::string ent(data + i + 1, semi - i - 1);
+                if (ent == "amp") out.push_back('&');
+                else if (ent == "lt") out.push_back('<');
+                else if (ent == "gt") out.push_back('>');
+                else if (ent == "quot") out.push_back('"');
+                else if (ent == "apos") out.push_back('\'');
+                else if (ent == "nbsp") out.push_back(' ');
+                else if (ent == "mdash") AppendUtf8(out, 0x2014);
+                else if (ent == "ndash") AppendUtf8(out, 0x2013);
+                else if (ent.size() >= 2 && ent[0] == '#') {
+                    uint32_t cp = 0;
+                    if (ent[1] == 'x' || ent[1] == 'X') {
+                        cp = static_cast<uint32_t>(strtoul(ent.c_str() + 2, nullptr, 16));
+                    } else {
+                        cp = static_cast<uint32_t>(strtoul(ent.c_str() + 1, nullptr, 10));
+                    }
+                    AppendUtf8(out, cp);
+                }
+                i = semi + 1;
+                continue;
+            }
+        }
+
+        // Ignore control bytes that could collide with dslibris style codes.
+        if (static_cast<unsigned char>(c) < 0x20 && c != '\n' && c != '\t') {
+            i++;
+            continue;
+        }
+        if (c == '\t') {
+            out.push_back(' ');
+            i++;
+            continue;
+        }
+
+        out.push_back(c);
+        i++;
+    }
+
+    if (bold) out.push_back(static_cast<char>(DICT_STYLE_BOLD_OFF));
+    if (italic) out.push_back(static_cast<char>(DICT_STYLE_ITALIC_OFF));
+
+    // Collapse >2 consecutive newlines and trim leading/trailing newlines/spaces.
+    std::string clean;
+    clean.reserve(out.size());
+    int nlCount = 0;
+    for (size_t k = 0; k < out.size(); k++) {
+        char ch = out[k];
+        if (ch == '\n') {
+            nlCount++;
+            if (nlCount <= 2) clean.push_back('\n');
+        } else {
+            nlCount = 0;
+            clean.push_back(ch);
+        }
+    }
+
+    size_t s = 0;
+    while (s < clean.size() && (clean[s] == '\n' || clean[s] == ' ')) s++;
+    size_t e = clean.size();
+    while (e > s && (clean[e - 1] == '\n' || clean[e - 1] == ' ')) e--;
+    return clean.substr(s, e - s);
+}
+
+std::string StarDict::FormatDefinition(const std::string& raw) const {
+    if (raw.empty()) return std::string();
+
+    std::string combined;
+    auto appendSection = [&](char typeChar, const char* data, size_t len) {
+        if (len == 0) return;
+        // Skip binary/non-text payloads (uppercase type chars: W=wav, P=pic, X=xf, r=resource)
+        if (typeChar >= 'A' && typeChar <= 'Z') return;
+        if (typeChar == 'r') return;
+
+        std::string part;
+        if (typeChar == 't' || typeChar == 'y') {
+            // Phonetic / pinyin transcription
+            std::string pron = StripMarkup(data, len, 'm');
+            if (!pron.empty()) {
+                part.push_back(static_cast<char>(DICT_STYLE_ITALIC_ON));
+                part.push_back('/');
+                part.append(pron);
+                part.push_back('/');
+                part.push_back(static_cast<char>(DICT_STYLE_ITALIC_OFF));
+            }
+        } else {
+            part = StripMarkup(data, len, typeChar);
+        }
+
+        if (!part.empty()) {
+            if (!combined.empty()) combined.push_back('\n');
+            combined.append(part);
+        }
+    };
+
+    const std::string& seq = info.sameTypeSequence;
+    if (!seq.empty()) {
+        size_t pos = 0;
+        for (size_t si = 0; si < seq.size() && pos < raw.size(); si++) {
+            char t = seq[si];
+            bool isLast = (si + 1 == seq.size());
+            if (t >= 'A' && t <= 'Z') {
+                if (isLast) {
+                    pos = raw.size();
+                } else {
+                    if (pos + 4 > raw.size()) break;
+                    uint32_t sz = ReadBE32(reinterpret_cast<const unsigned char*>(raw.data() + pos));
+                    pos += 4 + sz;
+                }
+            } else {
+                if (isLast) {
+                    appendSection(t, raw.data() + pos, raw.size() - pos);
+                    pos = raw.size();
+                } else {
+                    size_t nul = raw.find('\0', pos);
+                    if (nul == std::string::npos) {
+                        appendSection(t, raw.data() + pos, raw.size() - pos);
+                        pos = raw.size();
+                    } else {
+                        appendSection(t, raw.data() + pos, nul - pos);
+                        pos = nul + 1;
+                    }
+                }
+            }
+        }
+    } else {
+        size_t pos = 0;
+        while (pos < raw.size()) {
+            char t = raw[pos++];
+            if (t >= 'A' && t <= 'Z') {
+                if (pos + 4 > raw.size()) break;
+                uint32_t sz = ReadBE32(reinterpret_cast<const unsigned char*>(raw.data() + pos));
+                pos += 4;
+                if (pos + sz > raw.size()) break;
+                pos += sz;
+            } else {
+                size_t nul = raw.find('\0', pos);
+                if (nul == std::string::npos) {
+                    appendSection(t, raw.data() + pos, raw.size() - pos);
+                    break;
+                } else {
+                    appendSection(t, raw.data() + pos, nul - pos);
+                    pos = nul + 1;
+                }
+            }
+        }
+    }
+
+    return combined;
+}
+
+bool StarDict::ReadDefinition(const StarDictEntry& entry, std::string& outFormatted) {
+    std::string raw;
+    if (!ReadRawDefinition(entry, raw)) return false;
+    outFormatted = FormatDefinition(raw);
+    return true;
+}
