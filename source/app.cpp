@@ -52,6 +52,7 @@ App::App()
 
 	fontdir = std::string("font");
 	bookdir = std::string("book");
+	dictdir = std::string("dictionary");
 	bookcount = 0;
 	bookselected = NULL;
 	bookcurrent = NULL;
@@ -136,6 +137,9 @@ int App::Run(void)
 		book->GetBookmarks()->sort();
 	}
 
+	// Scan Dictionary/ folder for StarDict dictionaries.
+	dictManager.ScanDirectory(dictdir);
+
 	// Set up menus.
 
 	PrefsInit();
@@ -184,6 +188,14 @@ int App::Run(void)
 			case APP_MODE_PREFS_FONT_BOLDITALIC:
 			fontmenu->handleInput();
 			if (fontmenu->isDirty()) fontmenu->draw();
+			break;
+
+			case APP_MODE_DICT_SELECT:
+			dictUI.HandleSelectEvent(this);
+			break;
+
+			case APP_MODE_DICT_VIEW:
+			dictUI.HandleViewEvent(this);
 			break;
 		}
 	}
