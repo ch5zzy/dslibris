@@ -32,12 +32,14 @@ void App::PrefsInit()
 		"bold italic font",
 		"font size",
 		"paragraph spacing",
-		"screen orientation"
+		"screen orientation",
+		"dictionary"
 	};
 
 	for (int i=0; i<PREFS_BUTTON_COUNT; i++)
 	{
 		prefsButtons[i].Init(ts);
+		prefsButtons[i].Resize(192, 29);
 		prefsButtons[i].SetStyle(BUTTON_STYLE_SETTING);
 		prefsButtons[i].SetLabel1(labels[i]);
 		PrefsRefreshButton(i);
@@ -157,7 +159,7 @@ void App::PrefsHandleTouch() {
 		}
 	}
 
-	if (prefs_view_dirty) PrefsDraw();
+	if (mode == APP_MODE_PREFS && prefs_view_dirty) PrefsDraw();
 }
 
 void App::PrefsIncreasePixelSize()
@@ -238,18 +240,28 @@ void App::PrefsRefreshButton(int index) {
 				? std::string("Turned Right")
 				: std::string("Turned Left")
 			);
-		break;
+			break;
+		case PREFS_BUTTON_DICTIONARY:
+			prefsButtons[PREFS_BUTTON_DICTIONARY].SetLabel2(
+				dictManager.GetActiveBookName()
+			);
+			break;
 	}
 	prefs_view_dirty = true;
 }
 
 void App::PrefsHandlePress()
 {
-	//! Go to font view or flip orientation.
+	//! Go to font view, dictionary view, or flip orientation.
 
 	if (prefsSelected == PREFS_BUTTON_ORIENTATION) {
 		PrefsFlipOrientation();
 		prefs_view_dirty = true;
+		return;
+	}
+
+	if (prefsSelected == PREFS_BUTTON_DICTIONARY) {
+		ShowDictView();
 		return;
 	}
 

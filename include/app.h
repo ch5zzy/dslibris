@@ -72,6 +72,7 @@ https://github.com/rhaleblian/dslibris
 #define APP_MODE_QUIT 7
 #define APP_MODE_DICT_SELECT 8
 #define APP_MODE_DICT_VIEW 9
+#define APP_MODE_PREFS_DICT 10
 
 enum prefsbuttonindex {
 	PREFS_BUTTON_FONT,
@@ -81,6 +82,7 @@ enum prefsbuttonindex {
 	PREFS_BUTTON_FONTSIZE,
 	PREFS_BUTTON_PARASPACING,
 	PREFS_BUTTON_ORIENTATION,
+	PREFS_BUTTON_DICTIONARY,
 	PREFS_BUTTON_COUNT
 };
 
@@ -100,6 +102,7 @@ public:
 	u8 mode; 	     //! Current mode (browser, prefs, book, font, dict)
 	std::string fontdir;  //! Directory to search for font files
 	std::string dictdir;  //! Directory to search for StarDict files
+	std::string dictfile; //! Selected dictionary .ifo path
 	bool melonds;    //! Are we running in melonDS?
 
 	//! key functions are remappable to support screen flipping.
@@ -133,6 +136,7 @@ public:
 	u8 prefsSelected;
 	
 	class FontMenu *fontmenu;  //! Font selection menu.
+	class DictMenu *dictmenu;  //! Dictionary selection menu.
 	DictionaryManager dictManager;
 	DictUI dictUI;
 	std::vector<WordBox> pageWords; //! Word boxes for the currently displayed spread.
@@ -159,6 +163,7 @@ public:
 	void PrefsRefreshButtonFontBold();
 	void PrefsRefreshButtonFontItalic();
 	void PrefsRefreshButtonFontBoldItalic();
+	void ShowDictView();
 	void ShowSettingsView();
 
 private:

@@ -173,6 +173,16 @@ void start(	void *data,
 				p->prefs->swapshoulder = atoi(attr[i+1]);
 		}
 	}
+	else if (!strcmp(name,"dictionary"))
+	{
+		for (i=0;attr[i];i+=2)
+		{
+			if (!strcmp(attr[i],"path") && strlen(attr[i+1]))
+				app->dictdir = std::string(attr[i+1]);
+			else if (!strcmp(attr[i],"file") && strlen(attr[i+1]))
+				app->dictfile = std::string(attr[i+1]);
+		}
+	}
 }
 
 void end(void *data, const char *name)
@@ -271,6 +281,9 @@ int Prefs::Write()
  	fprintf(fp, "\t<paragraph indent=\"%d\" spacing=\"%d\" />\n",
 			app->paraindent,
 			app->paraspacing);
+	fprintf(fp, "\t<dictionary path=\"%s\" file=\"%s\" />\n",
+			app->dictdir.c_str(),
+			app->dictManager.GetActiveIfoPath().c_str());
 	fprintf(fp, "\t<books reopen=\"%d\">\n",
 			app->reopen);
     
