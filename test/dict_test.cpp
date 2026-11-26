@@ -190,11 +190,155 @@ void TestDictTextNormalization() {
     std::cout << "[PASS] DictText normalization\n";
 }
 
+void TestStarDictAndLookup() {
+    std::string root = "/tmp/dslibris_dict_test";
+    std::string sub = root + "/nested";
+    mkdir(root.c_str(), 0755);
+    mkdir(sub.c_str(), 0755);
+
+    // Build a multi-block dictionary (>500 words so .idx spans multiple 4 KB blocks!)
+    std::vector<TestWord> words;
+    for (int i = 0; i < 600; i++) {
+        char k[32];
+        snprintf(k, sizeof(k), "aa_pad_%04d", i);
+        words.push_back({k, std::string("<b>Padding</b> definition #") + std::to_string(i)});
+    }
+    words.push_back({"Apple", "<i>Proper</i> Apple Inc."});
+    words.push_back({"apple", "<b>noun</b> A crisp fruit &amp; common food.<br/>Second line."});
+    words.push_back({"carry", "To transport from one place to another."});
+    words.push_back({"dog", "A domesticated canine."});
+    words.push_back({"go", "To move or travel."});
+    words.push_back({"Haus", "German: house."});
+    words.push_back({"homme", "French: man."});
+    words.push_back({"ir", "Spanish: to go."});
+    words.push_back({"make", "To create or construct."});
+    words.push_back({"run", "To move swiftly on foot."});
+    words.push_back({"stop", "To cease movement."});
+    words.push_back({"whisper", "To speak very softly.<p><i>Example:</i> He whispered.</p>"});
+    words.push_back({"été", "French: summer."});
+    words.push_back({"図書館", "Japanese: library."});
+    words.push_back({"食べる", "Japanese: to eat."});
+    words.push_back({"zz_long", std::string(300, 'X') + "END"}); // Spans >2 dictzip chunks!
+
+    std::vector<std::pair<std::string, std::string>> syns = {
+        {"went", "go"},
+        {"ran", "run"},
+    };
+
+    BuildTestDict(root, "multi", "Multi Test Dict", "h", words, syns, /*useDictZip=*/true);
+
+    // Also build a flat uncompressed dict inside nested/ to verify subfolder scanning
+    std::vector<TestWord> nestedWords = {
+        {"ephemeral", "Lasting for a very short time."}
+    };
+    BuildTestDict(sub, "mini", "Nested Mini Dict", "m", nestedWords, {}, /*useDictZip=*/false);
+
+    // Generate a .lem file using our Python tool make_lemma.py!
+    std::string tsvPath = root + "/lemmas.tsv";
+    WriteFile(tsvPath,
+              "fui\tir\n"
+              "häuser\tHaus\n"
+              "食べなかった\t食べる\n");
+    struct stat st;
+    std::string scriptPath = (stat("../etc/tool/make_lemma.py", &st) == 0)
+        ? "../etc/tool/make_lemma.py"
+        : "dslibris/etc/tool/make_lemma.py";
+    std::string cmd = "python3 " + scriptPath + " --input " + tsvPath +
+                      " --output " + root + "/multi.lem";
+    int rc = system(cmd.c_str());
+    assert(rc == 0);
+
+    DictionaryManager mgr;
+    int count = mgr.ScanDirectory(root);
+    assert(count == 2);
+    assert(mgr.SelectByPath("multi.ifo"));
+
+    LookupResult res;
+
+    // 1. Exact case preference ("Apple" vs "apple")
+    assert(mgr.Lookup("Apple", res));
+    assert(res.headword == "Apple");
+    assert(res.definition.find("Apple Inc.") != std::string::npos);
+
+    assert(mgr.Lookup("apple", res));
+    assert(res.headword == "apple");
+    assert(res.definition.find("A crisp fruit & common food.") != std::string::npos);
+    assert(res.definition.find(static_cast<char>(DICT_STYLE_BOLD_ON)) != std::string::npos);
+
+    // 2. Multi-chunk dictzip boundary read (>2 chunks)
+    assert(mgr.Lookup("zz_long", res));
+    assert(res.definition == std::string(300, 'X') + "END");
+
+    // 3. StarDict .syn lookup (irregular English)
+    assert(mgr.Lookup("went", res));
+    assert(res.headword == "go");
+    assert(mgr.Lookup("Ran!", res));
+    assert(res.headword == "run");
+
+    // 4. .lem sidecar lookup (Spanish, German umlaut, Japanese conjugation)
+    assert(mgr.Lookup("fui", res));
+    assert(res.headword == "ir");
+    assert(res.matchedViaFallback);
+
+    assert(mgr.Lookup("Häuser", res));
+    assert(res.headword == "Haus");
+
+    assert(mgr.Lookup("食べなかった。", res, true));
+    assert(res.headword == "食べる");
+
+    // 5. Layer 1 normalization: French elision, English possessive, accented uppercase
+    assert(mgr.Lookup("«l’homme»", res));
+    assert(res.headword == "homme");
+
+    assert(mgr.Lookup("dog’s", res));
+    assert(res.headword == "dog");
+
+    assert(mgr.Lookup("Été", res));
+    assert(res.headword == "été");
+
+    // 6. Layer 3 suffix-trimming fallback (without needing rules in .lem)
+    assert(mgr.Lookup("“whispered,”", res));
+    assert(res.headword == "whisper");
+
+    assert(mgr.Lookup("making", res));
+    assert(res.headword == "make");
+
+    assert(mgr.Lookup("carried", res));
+    assert(res.headword == "carry");
+
+    assert(mgr.Lookup("stopped", res));
+    assert(res.headword == "stop");
+
+    // 7. Layer 3 CJK longest-prefix match (no spaces)
+    assert(mgr.Lookup("図書館へ行きます", res, true));
+    assert(res.headword == "図書館");
+    assert(res.queried == "図書館");
+
+    // 8. Layer 4 nearby headwords on miss
+    assert(!mgr.Lookup("whisprzx", res));
+    assert(!res.found);
+    assert(!res.nearby.empty());
+    bool sawWhisper = false;
+    for (const auto& w : res.nearby) {
+        if (w == "whisper") sawWhisper = true;
+    }
+    assert(sawWhisper);
+
+    // 9. Single active dictionary behavior: "ephemeral" is only in nested mini.ifo,
+    //    so it misses while multi.ifo is active and hits once switched to mini.ifo.
+    assert(!mgr.Lookup("ephemeral", res));
+    assert(mgr.SelectByPath("mini.ifo"));
+    assert(mgr.Lookup("ephemeral", res));
+    assert(res.definition == "Lasting for a very short time.");
+
+    std::cout << "[PASS] StarDict, dictzip, .syn, .lem, inflection, CJK & nearby tests\n";
+}
 
 } // namespace
 
 int main() {
     TestDictTextNormalization();
-    std::cout << "NORMALIZATION TESTS PASSED\n";
+    TestStarDictAndLookup();
+    std::cout << "ALL TESTS PASSED\n";
     return 0;
 }
