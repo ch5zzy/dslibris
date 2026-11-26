@@ -295,3 +295,280 @@ void DictUI::DrawSelectHint(App* app, const char* msg) {
     app->ts->SetScreen(prevScreen);
 }
 
+bool DictUI::HandleBookInput(App* app, bool& outTurnPrev, bool& outTurnNext, bool& outBookmark) {
+    outTurnPrev = false;
+    outTurnNext = false;
+    outBookmark = false;
+
+    u32 down = keysDown();
+    u32 held = keysHeld();
+    u32 up = keysUp();
+
+    // --- 1. Stylus tap vs hold-to-lookup ---
+    if (down & KEY_TOUCH) {
+        touchPosition coord = app->TouchRead();
+        touchActive = true;
+        touchHoldFrames = 0;
+        touchStartX = coord.py;
+        touchStartY = coord.px;
+        touchLastX = coord.py;
+        touchLastY = coord.px;
+        return true;
+    }
+
+    if (touchActive) {
+        if (held & KEY_TOUCH) {
+            touchPosition coord = app->TouchRead();
+            touchLastX = coord.py;
+            touchLastY = coord.px;
+            touchHoldFrames++;
+
+            if (touchHoldFrames == kHoldFrames) {
+                if (!app->dictManager.HasDictionary()) {
+                    DrawSelectHint(app, "no dict in Dictionary/");
+                } else if (!app->pageWords.empty()) {
+                    touchActive = false;
+                    BeginTouchSelection(app, touchLastX, touchLastY);
+                    return true;
+                }
+            }
+            return true;
+        }
+        if (up & KEY_TOUCH) {
+            touchActive = false;
+            if (touchHoldFrames < kHoldFrames) {
+                // Short tap: preserve original page-turn gesture (coord.py < 95).
+                if (touchStartX < 95) outTurnPrev = true;
+                else outTurnNext = true;
+            } else {
+                // Held with no dictionary loaded; clear hint.
+                DrawSelectHint(app, "");
+            }
+            return true;
+        }
+    }
+
+    // --- 2. Y button: short press = bookmark, hold >= 15 frames = D-pad lookup ---
+    if (down & KEY_Y) {
+        yHoldActive = true;
+        yHoldFrames = 0;
+        return true;
+    }
+    if (yHoldActive) {
+        if (held & KEY_Y) {
+            yHoldFrames++;
+            if (yHoldFrames == kHoldFrames) {
+                yHoldActive = false;
+                if (!app->dictManager.HasDictionary()) {
+                    DrawSelectHint(app, "no dict in Dictionary/");
+                } else if (!app->pageWords.empty()) {
+                    BeginDpadSelection(app);
+                }
+            }
+            return true;
+        }
+        if (up & KEY_Y) {
+            yHoldActive = false;
+            if (yHoldFrames < kHoldFrames) {
+                outBookmark = true;
+            }
+            return true;
+        }
+    }
+
+    return false;
+}
+
+void DictUI::BeginTouchSelection(App* app, u16 ux, u16 uy) {
+    enteredByTouch = true;
+    cancelled = false;
+    selectedWordIdx = -1;
+    hasHighlight = false;
+
+    u8 touchIdx = GetTouchScreenIdx(app);
+    targetScreenIdx = IsInInnerGutter(app, ux) ? static_cast<u8>(1 - touchIdx) : touchIdx;
+
+    int idx = FindNearestWord(app, targetScreenIdx, ux, uy);
+    if (idx < 0) {
+        // Fallback to the other screen if the current screen has no words.
+        targetScreenIdx = 1 - targetScreenIdx;
+        idx = FindNearestWord(app, targetScreenIdx, ux, uy);
+    }
+
+    ApplyHighlight(app, idx);
+    app->mode = APP_MODE_DICT_SELECT;
+    DrawSelectHint(app, "release:lookup  bottom:cancel");
+}
+
+void DictUI::BeginDpadSelection(App* app) {
+    enteredByTouch = false;
+    cancelled = false;
+    selectedWordIdx = -1;
+    selectHoldDir = 0;
+    selectHoldFrames = 0;
+    hasHighlight = false;
+
+    targetScreenIdx = app->pageWords[0].screenIdx;
+    ApplyHighlight(app, 0);
+    app->mode = APP_MODE_DICT_SELECT;
+    DrawSelectHint(app, "D-pad:move  A:lookup  B:cancel");
+}
+
+void DictUI::CancelSelection(App* app) {
+    ClearHighlight(app);
+    selectedWordIdx = -1;
+    selectHoldDir = 0;
+    selectHoldFrames = 0;
+    cancelled = false;
+    DrawSelectHint(app, "");
+    app->mode = APP_MODE_BOOK;
+}
+
+void DictUI::HandleSelectEvent(App* app) {
+    u32 down = keysDown();
+    u32 held = keysHeld();
+    u32 up = keysUp();
+
+    if (down & KEY_B) {
+        CancelSelection(app);
+        return;
+    }
+
+    if (enteredByTouch) {
+        if (held & KEY_TOUCH) {
+            touchPosition coord = app->TouchRead();
+            u16 ux = coord.py;
+            u16 uy = coord.px;
+
+            if (IsInCancelZone(app, uy)) {
+                if (!cancelled) {
+                    cancelled = true;
+                    ClearHighlight(app);
+                    selectedWordIdx = -1;
+                    DrawSelectHint(app, "release to cancel");
+                }
+                return;
+            }
+
+            if (cancelled) {
+                cancelled = false;
+                DrawSelectHint(app, "release:lookup  bottom:cancel");
+            }
+
+            u8 touchIdx = GetTouchScreenIdx(app);
+            // Dragging into the inner hinge switches to the opposite page;
+            // dragging into the outer edge away from the hinge switches back to the touch page.
+            if (targetScreenIdx == touchIdx && IsInInnerGutter(app, ux)) {
+                targetScreenIdx = 1 - touchIdx;
+            } else if (targetScreenIdx != touchIdx && IsInOuterEdge(app, ux)) {
+                targetScreenIdx = touchIdx;
+            }
+
+            int idx = FindNearestWord(app, targetScreenIdx, ux, uy);
+            if (idx >= 0) {
+                ApplyHighlight(app, idx);
+            }
+            return;
+        }
+
+        if (up & KEY_TOUCH || !(held & KEY_TOUCH)) {
+            if (cancelled || selectedWordIdx < 0) {
+                CancelSelection(app);
+            } else {
+                OpenDefinitionForSelected(app);
+            }
+            return;
+        }
+    } else {
+        // D-pad / button selection mode (also allows stylus tap to jump directly).
+        if (down & KEY_A) {
+            if (selectedWordIdx >= 0) {
+                OpenDefinitionForSelected(app);
+            } else {
+                CancelSelection(app);
+            }
+            return;
+        }
+
+        int n = static_cast<int>(app->pageWords.size());
+        if (n == 0) {
+            CancelSelection(app);
+            return;
+        }
+
+        // Note: app->key.* are in pre-rotation hardware space (matching app_book/app_browser/font):
+        //   Visual RIGHT = app->key.down, Visual LEFT = app->key.up,
+        //   Visual DOWN  = app->key.left, Visual UP   = app->key.right.
+        int curDir = 0;
+        if (held & app->key.down) curDir = 1;       // visual right (next word)
+        else if (held & app->key.up) curDir = 2;    // visual left (prev word)
+        else if (held & app->key.left) curDir = 3;  // visual down (next line)
+        else if (held & app->key.right) curDir = 4; // visual up (prev line)
+
+        int triggerDir = 0;
+        if (down & app->key.down) { triggerDir = 1; selectHoldDir = 1; selectHoldFrames = 0; }
+        else if (down & app->key.up) { triggerDir = 2; selectHoldDir = 2; selectHoldFrames = 0; }
+        else if (down & app->key.left) { triggerDir = 3; selectHoldDir = 3; selectHoldFrames = 0; }
+        else if (down & app->key.right) { triggerDir = 4; selectHoldDir = 4; selectHoldFrames = 0; }
+        else if (curDir != 0 && curDir == selectHoldDir) {
+            selectHoldFrames++;
+            int interval = (curDir <= 2) ? kSelectWordInterval : kSelectLineInterval;
+            if (selectHoldFrames >= kSelectDelayFrames &&
+                ((selectHoldFrames - kSelectDelayFrames) % interval) == 0) {
+                triggerDir = curDir;
+            }
+        } else {
+            selectHoldDir = curDir;
+            selectHoldFrames = 0;
+        }
+
+        int nextIdx = selectedWordIdx;
+        if (triggerDir == 1) {
+            nextIdx = (selectedWordIdx + 1 < n) ? (selectedWordIdx + 1) : 0;
+        } else if (triggerDir == 2) {
+            nextIdx = (selectedWordIdx > 0) ? (selectedWordIdx - 1) : (n - 1);
+        } else if (triggerDir == 3) {
+            // Jump to first word on next visual line
+            const WordBox& cur = app->pageWords[selectedWordIdx];
+            for (int i = selectedWordIdx + 1; i < n; i++) {
+                if (app->pageWords[i].screenIdx != cur.screenIdx ||
+                    app->pageWords[i].y > cur.y + cur.h / 2) {
+                    nextIdx = i;
+                    break;
+                }
+            }
+        } else if (triggerDir == 4) {
+            // Jump to word on previous visual line
+            const WordBox& cur = app->pageWords[selectedWordIdx];
+            for (int i = selectedWordIdx - 1; i >= 0; i--) {
+                if (app->pageWords[i].screenIdx != cur.screenIdx ||
+                    app->pageWords[i].y + app->pageWords[i].h / 2 < cur.y) {
+                    nextIdx = i;
+                    break;
+                }
+            }
+        } else if (down & (app->key.l | app->key.r)) {
+            // Toggle between left and right screens
+            u8 other = 1 - app->pageWords[selectedWordIdx].screenIdx;
+            for (int i = 0; i < n; i++) {
+                if (app->pageWords[i].screenIdx == other) {
+                    nextIdx = i;
+                    break;
+                }
+            }
+        } else if (down & KEY_TOUCH) {
+            // Switch seamlessly to stylus drag from D-pad mode
+            touchPosition coord = app->TouchRead();
+            enteredByTouch = true;
+            u8 touchIdx = GetTouchScreenIdx(app);
+            targetScreenIdx = IsInInnerGutter(app, coord.py) ? static_cast<u8>(1 - touchIdx) : touchIdx;
+            int idx = FindNearestWord(app, targetScreenIdx, coord.py, coord.px);
+            if (idx >= 0) nextIdx = idx;
+        }
+
+        if (nextIdx != selectedWordIdx && nextIdx >= 0) {
+            ApplyHighlight(app, nextIdx);
+        }
+    }
+}
+
